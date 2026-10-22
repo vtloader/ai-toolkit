@@ -41,6 +41,39 @@ export interface GpuInfo {
   fan: GpuFan;
 }
 
+/**
+ * Ascend NPU (npu-smi) device. Unlike NVIDIA GPUs there is no fan or memory
+ * clock to report; HBM size/usage and AICore utilization come from the
+ * `npu-smi info` table.
+ */
+export interface NpuUtilization {
+  aicore: number;
+  memory: number;
+}
+
+export interface NpuInfo {
+  index: number;
+  cardId: number;
+  chipId: number;
+  // Chip Logic ID from `npu-smi info -m`; this is what
+  // ASCEND_RT_VISIBLE_DEVICES selects and what jobs store as `npu:<id>`.
+  logicId: number;
+  name: string;
+  driverVersion: string;
+  health: string;
+  busId: string;
+  temperature: number;
+  utilization: NpuUtilization;
+  memory: GpuMemory;
+  power: GpuPower;
+}
+
+export interface AcceleratorOption {
+  id: string;
+  label: string;
+  vendor: 'nvidia' | 'npu';
+}
+
 export interface CpuInfo {
   name: string;
   cores: number;
@@ -55,7 +88,12 @@ export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
   isMac: boolean;
   gpus: GpuInfo[];
+  // Ascend NPUs are kept separate from `gpus` so NVIDIA indices (used for
+  // job scheduling) never collide with NPU card/chip ids.
+  hasNpuSmi?: boolean;
+  npus?: NpuInfo[];
   error?: string;
+  npuError?: string;
 }
 
 /**

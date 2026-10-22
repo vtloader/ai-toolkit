@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import os from 'os';
 import { cached } from '@/server/apiCache';
 import { loadMacstats } from '@/server/macstats';
+import { getNpuStats } from '@/server/npu';
 
 const execAsync = promisify(exec);
 
@@ -100,6 +101,7 @@ async function getGpuInfo() {
     if (macGpu) {
       return {
         hasNvidiaSmi: false,
+        hasNpuSmi: false,
         isMac: true,
         gpus: [
           {
@@ -125,31 +127,36 @@ async function getGpuInfo() {
     }
     return {
       hasNvidiaSmi: false,
+      hasNpuSmi: false,
       isMac: true,
       gpus: [],
+      npus: [],
       error: 'Could not read Mac GPU stats',
     };
   }
 
-  // Check if nvidia-smi is available
-  const hasNvidiaSmi = await checkNvidiaSmi(isWindows);
+  // NVIDIA and Ascend are probed independently so a machine with both shows
+  // both. NPUs stay in their own array (see GPUApiResponse).
+  const [hasNvidiaSmi, npuStats] = await Promise.all([checkNvidiaSmi(isWindows), getNpuStats()]);
+  const gpuStats = hasNvidiaSmi ? await getGpuStats(isWindows) : [];
 
-  if (!hasNvidiaSmi) {
+  const response = {
+    hasNvidiaSmi,
+    hasNpuSmi: npuStats.available,
+    isMac: false,
+    gpus: gpuStats,
+    npus: npuStats.npus,
+    npuError: npuStats.error,
+  };
+
+  if (!hasNvidiaSmi && !npuStats.available) {
     return {
-      hasNvidiaSmi: false,
-      isMac: false,
-      gpus: [],
+      ...response,
       error: 'nvidia-smi not found or not accessible',
     };
   }
 
-  // Get GPU stats
-  const gpuStats = await getGpuStats(isWindows);
-
-  return {
-    hasNvidiaSmi: true,
-    gpus: gpuStats,
-  };
+  return response;
 }
 
 export async function GET() {
@@ -161,8 +168,10 @@ export async function GET() {
     return NextResponse.json(
       {
         hasNvidiaSmi: false,
+        hasNpuSmi: false,
         isMac: false,
         gpus: [],
+        npus: [],
         error: `Failed to fetch GPU stats: ${error instanceof Error ? error.message : String(error)}`,
       },
       { status: 500 },

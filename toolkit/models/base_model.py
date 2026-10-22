@@ -42,7 +42,7 @@ from torchvision.transforms import functional as TF
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
-from toolkit.basic import flush
+from toolkit.basic import empty_device_cache, flush, is_npu_available
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -498,6 +498,7 @@ class BaseModel:
         # save current seed state for training
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        npu_rng_state = torch.npu.get_rng_state() if is_npu_available() else None
 
         if pipeline is None:
             pipeline = self.get_generation_pipeline()
@@ -571,6 +572,8 @@ class BaseModel:
                     self._sample_step_index = 0
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
+                    if is_npu_available():
+                        torch.npu.manual_seed(gen_config.seed)
 
                     generator = torch.manual_seed(gen_config.seed)
 
@@ -788,12 +791,14 @@ class BaseModel:
         unwrap_step_hooks()
         # clear pipeline and cache to reduce vram usage
         del pipeline
-        torch.cuda.empty_cache()
+        empty_device_cache()
 
         # restore training state
         torch.set_rng_state(rng_state)
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state(cuda_rng_state)
+        if npu_rng_state is not None:
+            torch.npu.set_rng_state(npu_rng_state)
 
         self.restore_device_state()
         if network is not None:

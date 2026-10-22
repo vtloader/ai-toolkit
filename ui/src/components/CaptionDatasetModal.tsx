@@ -48,7 +48,7 @@ export const CaptionDatasetModal: React.FC = () => {
   const [gpuIDs, setGpuIDs] = useState<string | null>(null);
   const [existingJobName, setExistingJobName] = useState<string | null>(null);
   const [hasLoadedExistingJob, setHasLoadedExistingJob] = useState(false);
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  const { acceleratorList, isGPUInfoLoaded } = useGPUInfo();
   const [activeTab, setActiveTab] = useState<'simple' | 'advanced'>('simple');
   const open = modalInfo !== null;
   const isSavingRef = useRef(false);
@@ -108,11 +108,11 @@ export const CaptionDatasetModal: React.FC = () => {
 
   useEffect(() => {
     if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
+      if (gpuIDs === null && acceleratorList.length > 0) {
+        setGpuIDs(acceleratorList[0].id);
       }
     }
-  }, [gpuList, isGPUInfoLoaded]);
+  }, [acceleratorList, isGPUInfoLoaded]);
 
   const handleClose = () => {
     if (modalInfo?.onClose) {
@@ -191,7 +191,7 @@ export const CaptionDatasetModal: React.FC = () => {
               <SelectInput
                 value={`${gpuIDs}`}
                 onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+                options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
               />
             </div>
           )}
@@ -208,7 +208,7 @@ export const CaptionDatasetModal: React.FC = () => {
               setJobConfig={setJobConfig}
               gpuIDs={gpuIDs}
               setGpuIDs={setGpuIDs}
-              gpuList={gpuList}
+              acceleratorList={acceleratorList}
               showGPUSelect={showGPUSelect}
             />
           ) : (

@@ -61,6 +61,13 @@ def get_optimizer(
 
         optimizer = Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
     elif lower_type.endswith("8bit"):
+        if not torch.cuda.is_available():
+            # bitsandbytes 8-bit optimizers are CUDA only (no NPU kernels);
+            # keep the training chain usable with full-precision AdamW
+            print(f"{optimizer_type} is not available on this device; falling back to torch.optim.AdamW")
+            return torch.optim.AdamW(
+                params, lr=float(learning_rate), eps=1e-6, **optimizer_params
+            )
         import bitsandbytes
 
         if lower_type == "adam8bit":

@@ -5,7 +5,9 @@ import { ChevronDown, ChevronUp, Cpu } from 'lucide-react';
 import useJobByRef from '@/hooks/useJobByRef';
 import useJobLog from '@/hooks/useJobLog';
 import useGPUInfo from '@/hooks/useGPUInfo';
+import { acceleratorIdsFromJob } from '@/utils/accelerators';
 import GPUWidget from '@/components/GPUWidget';
+import NPUWidget from '@/components/NPUWidget';
 import JobActionBar from '@/components/JobActionBar';
 import { getTotalSteps } from '@/utils/jobs';
 
@@ -30,13 +32,9 @@ export default function CaptionMonitor({ datasetPath, onHeightChange }: CaptionM
     if (isActive) setCollapsed(false);
   }, [job?.id, isActive]);
 
-  const gpuIds = useMemo(() => {
-    if (!job) return [];
-    if (job.gpu_ids === 'mps') return [0];
-    return job.gpu_ids.split(',').map(id => parseInt(id));
-  }, [job?.gpu_ids]);
+  const gpuIds = useMemo(() => acceleratorIdsFromJob(job?.gpu_ids), [job?.gpu_ids]);
 
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
+  const { gpuList, npuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { log, status: statusLog } = useJobLog(job?.id ?? '', isActive ? 2000 : null);
 
   const totalSteps = job ? getTotalSteps(job) : 0;
@@ -145,6 +143,8 @@ export default function CaptionMonitor({ datasetPath, onHeightChange }: CaptionM
           <div className="w-96 flex-shrink-0 overflow-y-auto p-3 pl-0 hidden md:block">
             {isGPUInfoLoaded && gpuList.length > 0 ? (
               <GPUWidget gpu={gpuList[0]} />
+            ) : isGPUInfoLoaded && npuList.length > 0 ? (
+              <NPUWidget npu={npuList[0]} />
             ) : (
               <div className="flex items-center gap-2 text-xs text-gray-500 p-2">
                 <Cpu className="w-4 h-4" /> Loading GPU info...

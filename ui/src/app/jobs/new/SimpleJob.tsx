@@ -9,7 +9,7 @@ import {
 } from './options';
 import { useModelArchs } from '@/extensions/modelArchs';
 import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { AcceleratorOption, GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -41,7 +41,7 @@ type Props = {
   runId: string | null;
   gpuIDs: string | null;
   setGpuIDs: (value: string | null) => void;
-  gpuList: any;
+  acceleratorList: AcceleratorOption[];
   datasetOptions: any;
   isLoading?: boolean;
 };
@@ -56,7 +56,7 @@ export default function SimpleJob({
   runId,
   gpuIDs,
   setGpuIDs,
-  gpuList,
+  acceleratorList,
   datasetOptions,
   isLoading,
 }: Props) {
@@ -254,11 +254,11 @@ export default function SimpleJob({
             />
             {showGPUSelect && (
               <SelectInput
-                label="GPU ID"
+                label="Accelerator ID"
                 value={`${gpuIDs}`}
                 docKey="gpuids"
                 onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+                options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
               />
             )}
             {disableSections.includes('trigger_word') ? null : (

@@ -214,9 +214,22 @@ const startAndWatchJob = (job: Job) => {
       console.error('Error moving log file:', e);
     }
 
+    // Ascend jobs store their accelerator as `npu:<logic id>` (NVIDIA keeps
+    // the legacy plain index). Only the NPU path is new; CUDA/MPS env below
+    // is unchanged.
+    const npuJob = job.gpu_ids.startsWith('npu:');
+    const npuVisibleIds = job.gpu_ids
+      .split(',')
+      .map(id => id.trim().replace(/^npu:/, ''))
+      .join(',');
+
     // update the config dataset path
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
+    if (npuJob) {
+      // ASCEND_RT_VISIBLE_DEVICES renumbers the selected chips from local 0.
+      jobConfig.config.process[0].device = 'npu:0';
+    }
     if (job.job_type === 'inference') {
       // the engine publishes engine.json (endpoint + token) and writes its
       // outputs under the job folder, which the UI proxy/file routes know
@@ -246,11 +259,16 @@ const startAndWatchJob = (job: Job) => {
 
     const additionalEnv: any = {
       AITK_JOB_ID: jobID,
-      CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
-      CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
       IS_AI_TOOLKIT_UI: '1',
       PYTHONUNBUFFERED: '1', // write Python output immediately so it is not lost on a crash
     };
+
+    if (npuJob) {
+      additionalEnv.ASCEND_RT_VISIBLE_DEVICES = npuVisibleIds;
+    } else {
+      additionalEnv.CUDA_DEVICE_ORDER = 'PCI_BUS_ID';
+      additionalEnv.CUDA_VISIBLE_DEVICES = `${job.gpu_ids}`;
+    }
 
     // HF_TOKEN
     const hfToken = await getHFToken();

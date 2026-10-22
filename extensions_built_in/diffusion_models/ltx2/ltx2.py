@@ -4,7 +4,6 @@ import os
 from typing import List, Optional
 
 import torch
-import torchaudio
 from transformers import Gemma3Config
 import yaml
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
@@ -158,6 +157,9 @@ class AudioProcessor(torch.nn.Module):
         n_fft: int,
     ) -> None:
         super().__init__()
+        # torchaudio is only needed by the audio-conditioning path
+        import torchaudio
+
         self.sample_rate = sample_rate
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
@@ -184,6 +186,8 @@ class AudioProcessor(torch.nn.Module):
         """Resample waveform to target sample rate if needed."""
         if source_rate == target_rate:
             return waveform
+        import torchaudio
+
         resampled = torchaudio.functional.resample(waveform, source_rate, target_rate)
         return resampled.to(device=waveform.device, dtype=waveform.dtype)
 

@@ -10,7 +10,7 @@ import {
   TextAreaInput,
   TextInput,
 } from '@/components/formInputs';
-import { CaptionJobConfig, CaptionLora } from '@/types';
+import { AcceleratorOption, CaptionJobConfig, CaptionLora } from '@/types';
 import { handleCaptionerTypeChange } from '@/helpers/captionJobConfig';
 import {
   batchSizeOptions,
@@ -30,11 +30,11 @@ type Props = {
   setJobConfig: (value: any, key?: string) => void;
   gpuIDs: string | null;
   setGpuIDs: (value: string | null) => void;
-  gpuList: any;
+  acceleratorList: AcceleratorOption[];
   showGPUSelect: boolean;
 };
 
-const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, setGpuIDs, gpuList, showGPUSelect }) => {
+const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, setGpuIDs, acceleratorList, showGPUSelect }) => {
   const selectedCaptionOption = captionerTypes.find(option => option.name === jobConfig.config.process[0].type);
   const additionalSections = selectedCaptionOption?.additionalSections || [];
   const captionPrompts = selectedCaptionOption?.captionPrompts || {};
@@ -65,10 +65,10 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
         {showGPUSelect && (
           <div>
             <SelectInput
-              label="GPU ID"
+              label="Accelerator ID"
               value={`${gpuIDs}`}
               onChange={value => setGpuIDs(value)}
-              options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+              options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
             />
           </div>
         )}

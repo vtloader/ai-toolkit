@@ -5,6 +5,8 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Union
 
 import torch
+
+from toolkit.basic import is_npu_available
 import yaml
 
 from jobs.process.BaseProcess import BaseProcess
@@ -36,6 +38,8 @@ class BaseTrainProcess(BaseProcess):
             torch.manual_seed(self.training_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(self.training_seed)
+            if is_npu_available():
+                torch.npu.manual_seed(self.training_seed)
             random.seed(self.training_seed)
 
         self.progress_bar = None

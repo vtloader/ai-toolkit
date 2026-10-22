@@ -30,7 +30,7 @@ export default function TrainingForm() {
   const cloneId = searchParams.get('cloneId');
   const [gpuIDs, setGpuIDs] = useState<string | null>(null);
   const { settings, isSettingsLoaded } = useSettings();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  const { acceleratorList, isGPUInfoLoaded } = useGPUInfo();
   const { datasets, status: datasetFetchStatus } = useDatasetList();
   const [datasetOptions, setDatasetOptions] = useState<{ value: string; label: string }[]>([]);
   const [showAdvancedView, setShowAdvancedView] = useState(false);
@@ -62,7 +62,7 @@ export default function TrainingForm() {
         try {
           parsed.config.process[0].sqlite_db_path = './aitk_db.db';
           parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-          parsed.config.process[0].device = 'cuda';
+          parsed.config.process[0].device = gpuIDs?.startsWith('npu:') ? 'npu:0' : 'cuda';
           parsed.config.process[0].performance_log_every = 10;
         } catch (err) {
           console.warn('Could not set required fields on imported config:', err);
@@ -136,11 +136,11 @@ export default function TrainingForm() {
 
   useEffect(() => {
     if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
+      if (gpuIDs === null && acceleratorList.length > 0) {
+        setGpuIDs(acceleratorList[0].id);
       }
     }
-  }, [gpuList, isGPUInfoLoaded]);
+  }, [acceleratorList, isGPUInfoLoaded]);
 
   useEffect(() => {
     if (isSettingsLoaded) {
@@ -207,7 +207,7 @@ export default function TrainingForm() {
               <SelectInput
                 value={`${gpuIDs}`}
                 onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+                options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
               />
             </div>
             <div className="hidden sm:block mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
@@ -296,7 +296,7 @@ export default function TrainingForm() {
               try {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';
                 parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-                parsed.config.process[0].device = 'cuda';
+                parsed.config.process[0].device = gpuIDs?.startsWith('npu:') ? 'npu:0' : 'cuda';
                 parsed.config.process[0].performance_log_every = 10;
               } catch (e) {
                 console.warn(e);
@@ -322,7 +322,7 @@ export default function TrainingForm() {
               runId={runId}
               gpuIDs={gpuIDs}
               setGpuIDs={setGpuIDs}
-              gpuList={gpuList}
+              acceleratorList={acceleratorList}
               datasetOptions={datasetOptions}
               isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
             />

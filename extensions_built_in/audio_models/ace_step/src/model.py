@@ -22,7 +22,6 @@ import torch
 
 from toolkit.models.v2._mixin import OstrisModelMixin
 import torch.nn.functional as F
-import torchaudio
 from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoTokenizer
@@ -1363,6 +1362,8 @@ def load_models(checkpoint_path, device="cuda", dtype=torch.bfloat16):
 @torch.inference_mode()
 def get_latent(audio_path, models):
     """Encode audio file to VAE latent. Returns [1, 64, T] tensor."""
+    import torchaudio
+
     vae, device, dtype = models["vae"], models["device"], models["dtype"]
     wav, sr = torchaudio.load(audio_path)
     if sr != SAMPLE_RATE:
@@ -1575,6 +1576,8 @@ def main():
         ts,
         cfg,
     )
+
+    import torchaudio
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torchaudio.save(args.output, wav, SAMPLE_RATE)

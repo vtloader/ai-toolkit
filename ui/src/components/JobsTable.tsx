@@ -2,7 +2,6 @@ import { useMemo, useState } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo } from '@/types';
 import JobActionBar from './JobActionBar';
 import { Job, Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
@@ -10,6 +9,7 @@ import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
+import { acceleratorIdsFromJob } from '@/utils/accelerators';
 import { openConfirm } from '@/components/ConfirmModal';
 import { deleteJob, getTotalSteps, stopJob } from '@/utils/jobs';
 import { Trash2 } from 'lucide-react';
@@ -23,7 +23,7 @@ interface JobsTableProps {
 export default function JobsTable({ onlyActive = false, job_type = null }: JobsTableProps) {
   const { jobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
   const { queues, status: queueStatus, refreshQueues } = useQueueList();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  const { acceleratorList, isGPUInfoLoaded } = useGPUInfo();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
 
@@ -215,14 +215,13 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     if (!isGPUInfoLoaded) return {};
     if (jobs.length === 0) return {};
     let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
-    gpuList.forEach(gpu => {
-      jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
+    acceleratorList.forEach(accel => {
+      jd[accel.id] = { name: accel.label, jobs: [] };
     });
     jd['Idle'] = { name: 'Idle', jobs: [] };
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
-      const key = `${gpu?.index || '0'}`;
-      if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
+      const key = acceleratorIdsFromJob(job.gpu_ids).find(id => id in jd);
+      if (['queued', 'running', 'stopping'].includes(job.status) && key) {
         jd[key].jobs.push(job);
       } else {
         jd['Idle'].jobs.push(job);

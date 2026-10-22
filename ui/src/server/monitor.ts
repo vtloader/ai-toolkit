@@ -4,7 +4,8 @@ import os from 'os';
 import si from 'systeminformation';
 import { loadMacstats } from '@/server/macstats';
 import { createLoadSampler, readCpuTemperature, readMemory } from '@/server/cpuStats';
-import { CpuInfo, GpuInfo, GPUApiResponse, MonitorHistoryPoint, MonitorInit, MonitorSample } from '@/types';
+import { CpuInfo, GpuInfo, GPUApiResponse, MonitorHistoryPoint, MonitorInit, MonitorSample, NpuInfo } from '@/types';
+import { getNpuStats } from '@/server/npu';
 import { historyPointFromSample, MONITOR_HISTORY_LENGTH, MONITOR_TICK_MS } from '@/utils/monitorSample';
 
 const execFileAsync = promisify(execFile);
@@ -34,6 +35,10 @@ const NV_WATCHDOG_MS = 15_000;
 const NV_BATCH_FLUSH_MS = 100;
 // Temperature refresh is decoupled from the tick (see refreshCpuTemp)
 const CPU_TEMP_REFRESH_MS = 5000;
+// npu-smi has no resident streaming mode we can rely on, so poll it at a
+// slower cadence than the UI tick; one `npu-smi info` covers every chip.
+const NPU_REFRESH_MS = 2000;
+const NPU_RETRY_MS = 30_000;
 
 // Power limits for GPUs whose driver reports none (nvidia-smi gives [N/A]).
 // GB10 (DGX Spark) is a unified SoC with no settable GPU limit; 140 W is
@@ -125,6 +130,12 @@ class SystemMonitor {
   private nvOneShotMode = false;
   private nvOneShotInFlight = false;
   private lastNvLineAt = 0;
+  private latestNpus: NpuInfo[] = [];
+  private hasNpuSmi = false;
+  private npuError: string | undefined;
+  private npuInFlight = false;
+  private npuTimer: NodeJS.Timeout | null = null;
+  private npuRetryTimer: NodeJS.Timeout | null = null;
   private tickInFlight = false;
   private lastCpuTemp = 0;
   private cpuTempInFlight = false;
@@ -139,6 +150,9 @@ class SystemMonitor {
     } else {
       this.startNvLoop();
     }
+    if (process.platform === 'linux') {
+      this.startNpuLoop();
+    }
     // Never leave a resident nvidia-smi behind.
     process.once('exit', () => {
       try {
@@ -146,6 +160,8 @@ class SystemMonitor {
       } catch {
         // already gone
       }
+      if (this.npuTimer) clearInterval(this.npuTimer);
+      if (this.npuRetryTimer) clearTimeout(this.npuRetryTimer);
     });
     // Fixed cadence; a tick that overruns the interval (slow temperature
     // read, hung nvidia-smi one-shot) just skips beats instead of stacking.
@@ -162,7 +178,7 @@ class SystemMonitor {
     return {
       t: Date.now(),
       cpu: this.latestCpu,
-      gpu: withSharedMemory(this.latestGpu, this.latestCpu),
+      gpu: withSharedMemory(this.getGpuResponse(), this.latestCpu),
       history: [...this.history],
     };
   }
@@ -202,7 +218,7 @@ class SystemMonitor {
     const sample: MonitorSample = {
       t,
       cpu: this.latestCpu,
-      gpu: withSharedMemory(this.latestGpu, this.latestCpu),
+      gpu: withSharedMemory(this.getGpuResponse(), this.latestCpu),
     };
     this.history.push(historyPointFromSample(sample));
     if (this.history.length > MONITOR_HISTORY_LENGTH) {
@@ -377,6 +393,64 @@ class SystemMonitor {
         },
       ],
     };
+  }
+
+  private getGpuResponse(): GPUApiResponse {
+    return {
+      ...this.latestGpu,
+      hasNpuSmi: this.hasNpuSmi,
+      npus: this.latestNpus,
+      npuError: this.npuError,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Ascend NPU (npu-smi one-shot polling)
+  // -------------------------------------------------------------------------
+  private startNpuLoop(): void {
+    void this.sampleNpu();
+  }
+
+  private async sampleNpu(): Promise<void> {
+    if (this.npuInFlight) return;
+    this.npuInFlight = true;
+    try {
+      const stats = await getNpuStats();
+      this.hasNpuSmi = stats.available;
+      this.latestNpus = stats.npus;
+      this.npuError = stats.error;
+
+      if (stats.available) {
+        if (this.npuRetryTimer) {
+          clearTimeout(this.npuRetryTimer);
+          this.npuRetryTimer = null;
+        }
+        if (!this.npuTimer) {
+          this.npuTimer = setInterval(() => {
+            void this.sampleNpu();
+          }, NPU_REFRESH_MS);
+          this.npuTimer.unref?.();
+        }
+      } else if (this.npuTimer) {
+        clearInterval(this.npuTimer);
+        this.npuTimer = null;
+      }
+    } catch (error) {
+      this.npuError = `Failed to fetch NPU stats: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      this.npuInFlight = false;
+    }
+
+    // Keep probing at a low rate so a driver/tool that appears after boot is
+    // picked up without a server restart (and so npu-smi is not spawned at
+    // the UI tick rate when it is unavailable).
+    if (!this.hasNpuSmi && !this.npuTimer && !this.npuRetryTimer) {
+      this.npuRetryTimer = setTimeout(() => {
+        this.npuRetryTimer = null;
+        void this.sampleNpu();
+      }, NPU_RETRY_MS);
+      this.npuRetryTimer.unref?.();
+    }
   }
 
   // -------------------------------------------------------------------------

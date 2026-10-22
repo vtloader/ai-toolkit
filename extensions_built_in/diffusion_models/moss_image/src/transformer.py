@@ -17,6 +17,7 @@ of the RoPE axis the vendor leaves at 0, optionally isolated so their per-block
 K/V can be cached across sampling steps.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -26,6 +27,29 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+
+# NPU-only fast paths; the env switch exists for A/B benchmarking and debugging.
+# Default ("all") enables every fusion; "none" restores the portable path.
+def _parse_fusions():
+    raw = os.environ.get("AITK_MOSS_NPU_FUSIONS", "all").lower()
+    if raw in ("0", "off", "false", "none"):
+        return frozenset()
+    if raw in ("1", "on", "true", "all"):
+        return frozenset(("rms", "rope", "attn"))
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+_NPU_FUSIONS = _parse_fusions()
+_NPU_RMS_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _npu_ops():
+    """Lazy torch_npu handle: CUDA/CPU installs do not have the package."""
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+    return torch_npu
 
 
 @dataclass
@@ -46,6 +70,21 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        if (
+            "rms" in _NPU_FUSIONS
+            and x.device.type == "npu"
+            and x.dtype in _NPU_RMS_DTYPES
+            and self.weight.dtype == x.dtype
+            and x.dim() >= 2
+            and x.shape[-1] == self.weight.numel()
+        ):
+            npu = _npu_ops()
+            if npu is not None:
+                try:
+                    # fused rmsnorm (fp32 internal math, gamma folded in)
+                    return npu.npu_rms_norm(x, self.weight, 1e-6)[0]
+                except Exception:
+                    pass
         y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
         return y.to(x.dtype) * self.weight
 
@@ -56,21 +95,148 @@ def _situ(hidden, gate):
     )
 
 
-def _rotate(x, rope):
+def _rope_cos_sin(rope):
     sin, cos = rope.chunk(2, -1)
     sin = torch.cat((sin, sin), -1).unsqueeze(-2)
     cos = torch.cat((cos, cos), -1).unsqueeze(-2)
+    return sin, cos
+
+
+def _rope_slice(rope, start, stop):
+    if isinstance(rope, tuple):
+        return tuple(t[:, start:stop] for t in rope)
+    return rope[:, start:stop]
+
+
+def _rotate(x, rope, cos_sin=None):
+    if cos_sin is None:
+        cos_sin = rope if isinstance(rope, tuple) else _rope_cos_sin(rope)
+    sin, cos = cos_sin
+    if "rope" in _NPU_FUSIONS and x.device.type == "npu" and x.dim() == 4:
+        npu = _npu_ops()
+        if npu is not None and x.dtype in _NPU_RMS_DTYPES:
+            try:
+                # half-mode rotary matches the cos/sin layout built above
+                return npu.npu_rotary_mul(x, cos, sin)
+            except Exception:
+                pass
     a, b = x.chunk(2, -1)
     return x * cos + torch.cat((-b, a), -1) * sin
+
+
+def _sdpa_mask(mask, q, k):
+    """torch_npu's fused attention only accepts full [Sq, Skv] masks; broadcast
+    bool masks like (B, 1, 1, S) are rejected at tiling time. Expanding is a
+    stride-0 view, so it costs no memory, and True still means "attend"."""
+    if mask is None or mask.dtype != torch.bool or q.device.type != "npu":
+        return mask
+    sq, skv = q.shape[-2], k.shape[-2]
+    if mask.shape[-2:] == (sq, skv):
+        return mask
+    return mask.expand(*mask.shape[:-2], sq, skv)
+
+
+def _fused_attention(npu, q, k, v, heads, scale, mask):
+    # BSND keeps the sequence-major layout: no transposes around attention.
+    return npu.npu_fusion_attention(
+        q,
+        k,
+        v,
+        heads,
+        "BSND",
+        atten_mask=~mask if mask is not None else None,
+        scale=scale,
+        pre_tockens=65536,
+        next_tockens=65536,
+        keep_prob=1.0,
+        sync=False,
+    )[0]
+
+
+def _attention_npu(
+    q, k, v, rope, heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+):
+    """CANN fused attention on BSND tensors. Returns None when unsupported so
+    the caller can fall back to the portable SDPA path."""
+    head_dim = q.shape[-1] // heads
+    if (
+        q.dim() != 3
+        or q.dtype not in _NPU_RMS_DTYPES
+        or head_dim % 2
+        or head_dim > 896
+        or q.shape[0] >= 1000
+        or heads >= 1000
+        or (mask is not None and mask.dtype != torch.bool)
+        or (isolate_split is not None and mask is not None)
+    ):
+        return None
+    npu = _npu_ops()
+    if npu is None:
+        return None
+    shape = (*q.shape[:2], heads, head_dim)
+    try:
+        cos_sin = rope if isinstance(rope, tuple) else _rope_cos_sin(rope)
+        q = _rotate(q.reshape(shape), rope, cos_sin)
+        k = _rotate(k.reshape(shape), rope, cos_sin)
+        v = v.reshape(shape)
+        attn_mask = None
+        if mask is not None:
+            sq, skv = q.shape[1], k.shape[1]
+            if mask.shape[-2:] != (sq, skv):
+                mask = mask.expand(*mask.shape[:-2], sq, skv)
+            attn_mask = mask
+        captured = None
+        if kv_capture is not None:
+            captured = tuple(
+                t[:, ref_span[0] : ref_span[1]].clone(memory_format=torch.contiguous_format)
+                for t in (k, v)
+            )
+        if kv_cache is not None:
+            k = torch.cat((k, kv_cache[0].to(k.dtype)), 1)
+            v = torch.cat((v, kv_cache[1].to(v.dtype)), 1)
+        q, k = q.to(v.dtype), k.to(v.dtype)
+        scale = head_dim**-0.5
+        if isolate_split is not None:
+            live = _fused_attention(npu, q[:, :isolate_split], k, v, heads, scale, attn_mask)
+            ref = _fused_attention(
+                npu,
+                q[:, isolate_split:],
+                k[:, isolate_split:],
+                v[:, isolate_split:],
+                heads,
+                scale,
+                None,
+            )
+            out = torch.cat((live, ref), 1)
+        else:
+            out = _fused_attention(npu, q, k, v, heads, scale, attn_mask)
+    except Exception:
+        return None
+    if captured is not None:
+        kv_capture.append(captured)
+    return out.flatten(2)
 
 
 def _attention(
     q, k, v, rope, heads, mask, ref_span=None, kv_capture=None, kv_cache=None, isolate_split=None
 ):
+    if "attn" in _NPU_FUSIONS and q.device.type == "npu":
+        out = _attention_npu(
+            q, k, v, rope, heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+        )
+        if out is not None:
+            return out
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
-    q = _rotate(q.reshape(shape), rope).transpose(1, 2)
-    k = _rotate(k.reshape(shape), rope).transpose(1, 2)
+    if "rope" in _NPU_FUSIONS and q.device.type == "npu":
+        # build the doubled cos/sin once per attention instead of per rotate
+        cos_sin = rope if isinstance(rope, tuple) else _rope_cos_sin(rope)
+        q = _rotate(q.reshape(shape), rope, cos_sin).transpose(1, 2)
+        k = _rotate(k.reshape(shape), rope, cos_sin).transpose(1, 2)
+    else:
+        q = _rotate(q.reshape(shape), rope).transpose(1, 2)
+        k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
+    mask = _sdpa_mask(mask, q, k)
     if kv_capture is not None:
         # post-RoPE reference K/V, reused as extra keys on later steps. Copies:
         # slices would pin the full-sequence K and the whole fused qkv output
@@ -352,10 +518,13 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
 
     def _time_modulation(self, times, dtype):
         half = self.params.freq_dim // 2
+        # NPU has no float64 (torch_npu silently downcasts and warns); the
+        # sinusoid only feeds a bf16 MLP, so float32 there is equivalent
+        calc_dtype = torch.float32 if times.device.type == "npu" else torch.float64
         freq = 10000 ** (
-            -torch.arange(half, device=times.device, dtype=torch.float64) / half
+            -torch.arange(half, device=times.device, dtype=calc_dtype) / half
         )
-        phase = times.double()[:, None] * freq
+        phase = times.to(calc_dtype)[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
         time = self.time_embedding(embedding.to(dtype)).float()
         mod = self.shared_block_modulation(time.to(dtype)).view(times.shape[0], 6, -1)
@@ -429,6 +598,10 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
             modulation = (mod, ref_mod, num_live)
             rope = torch.cat((rope, ref_rope.to(dtype)), 1)
 
+        if "rope" in _NPU_FUSIONS and device.type == "npu":
+            # all blocks share the same rope: double cos/sin once, not per layer
+            rope = _rope_cos_sin(rope)
+
         text_mask = None
         if padded:
             text_mask = valid[:, None, None, :]
@@ -458,7 +631,7 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         video = hidden_states.flatten(2).transpose(1, 2).to(dtype)
         video = self.video_embedder(video.contiguous())
         text = self.text_embedder.proj(context.to(dtype))
-        text_rope = rope[:, num_image:num_live]
+        text_rope = _rope_slice(rope, num_image, num_live)
         for block in self.text_embedder.blocks:
             text = self._ckpt(block, text, text_rope, text_mask)
 

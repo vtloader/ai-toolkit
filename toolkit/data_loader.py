@@ -10,6 +10,8 @@ from typing import List, TYPE_CHECKING
 import cv2
 import numpy as np
 import torch
+
+from toolkit.basic import is_npu_available
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
@@ -798,7 +800,7 @@ def get_dataloader_from_datasets(
     # severe PCIe thrashing for users at the VRAM ceiling. Off by default; opt
     # in via 'pin_memory: true' on the dataset config when VRAM headroom is
     # stable.
-    if torch.cuda.is_available() and dataset_config_list[0].pin_memory:
+    if (torch.cuda.is_available() or is_npu_available()) and dataset_config_list[0].pin_memory:
         dataloader_kwargs['pin_memory'] = True
 
     if has_buckets:

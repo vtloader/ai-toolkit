@@ -8,7 +8,6 @@ import threading
 
 import numpy as np
 import torch
-import torchaudio
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 from transformers.generation import LogitsProcessor, LogitsProcessorList
 from collections import OrderedDict
@@ -367,6 +366,8 @@ class AceStepCaptioner(BaseCaptioner):
     @staticmethod
     def _to_model_audio(waveform: torch.Tensor, sr: int) -> np.ndarray:
         """[C, T] at any rate -> mono float array at TARGET_SAMPLE_RATE."""
+        import torchaudio
+
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
         if sr != TARGET_SAMPLE_RATE:
@@ -375,6 +376,8 @@ class AceStepCaptioner(BaseCaptioner):
 
     @staticmethod
     def _load_audio(file_path: str):
+        import torchaudio
+
         waveform, sr = torchaudio.load(file_path)
         return AceStepCaptioner._to_model_audio(waveform, sr)
 
@@ -406,6 +409,8 @@ class AceStepCaptioner(BaseCaptioner):
         """CPU side of one file (runs in a worker thread): librosa analysis,
         decode + resample, and the mel/tokenize pass for each model. Vocal
         separation is the one GPU step here, serialized by separator_lock."""
+        import torchaudio
+
         waveform, sr = torchaudio.load(file_path)
         audio_data = self._to_model_audio(waveform, sr)
         lyrics_audio = (

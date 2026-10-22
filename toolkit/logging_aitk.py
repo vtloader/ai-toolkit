@@ -290,30 +290,40 @@ class UILogger:
 
         con.execute("BEGIN;")
 
-        # steps upsert
+        # Keep this SQL compatible with the SQLite bundled with the Python
+        # build here (3.17, pre-UPSERT). INSERT OR REPLACE on steps would
+        # cascade-delete metrics, so steps and keys use insert + update.
         if self._pending_steps:
             con.executemany(
-                "INSERT INTO steps(step, wall_time) VALUES(?, ?) "
-                "ON CONFLICT(step) DO UPDATE SET wall_time=excluded.wall_time;",
+                "INSERT OR IGNORE INTO steps(step, wall_time) VALUES(?, ?);",
                 self._pending_steps,
             )
-
-        # keys table upsert (maintains list of keys + seen range)
-        if self._pending_key_minmax:
             con.executemany(
-                "INSERT INTO metric_keys(key, first_seen_step, last_seen_step) VALUES(?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET "
-                "first_seen_step=MIN(metric_keys.first_seen_step, excluded.first_seen_step), "
-                "last_seen_step=MAX(metric_keys.last_seen_step, excluded.last_seen_step);",
-                [(k, lo, hi) for k, (lo, hi) in self._pending_key_minmax.items()],
+                "UPDATE steps SET wall_time = ? WHERE step = ?;",
+                [(wall_time, step) for step, wall_time in self._pending_steps],
             )
 
-        # metrics upsert
+        # keys table (maintains list of keys + seen range)
+        if self._pending_key_minmax:
+            key_rows = [(k, lo, hi) for k, (lo, hi) in self._pending_key_minmax.items()]
+            con.executemany(
+                "INSERT OR IGNORE INTO metric_keys(key, first_seen_step, last_seen_step) "
+                "VALUES(?, ?, ?);",
+                key_rows,
+            )
+            con.executemany(
+                "UPDATE metric_keys SET "
+                "first_seen_step = MIN(first_seen_step, ?), "
+                "last_seen_step = MAX(last_seen_step, ?) "
+                "WHERE key = ?;",
+                [(lo, hi, k) for k, lo, hi in key_rows],
+            )
+
+        # metrics upsert (no child rows, REPLACE is safe)
         if self._pending_metrics:
             con.executemany(
-                "INSERT INTO metrics(step, key, value_real, value_text) VALUES(?, ?, ?, ?) "
-                "ON CONFLICT(step, key) DO UPDATE SET "
-                "value_real=excluded.value_real, value_text=excluded.value_text;",
+                "INSERT OR REPLACE INTO metrics(step, key, value_real, value_text) "
+                "VALUES(?, ?, ?, ?);",
                 self._pending_metrics,
             )
 

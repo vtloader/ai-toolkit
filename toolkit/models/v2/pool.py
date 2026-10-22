@@ -20,6 +20,8 @@ from typing import Dict, Optional
 
 import torch
 
+from toolkit.basic import is_npu_available
+
 
 def _stable(value):
     """JSON-safe, deterministic rendering of a key part."""
@@ -191,6 +193,8 @@ class ComponentPool:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if is_npu_available():
+            torch.npu.empty_cache()
 
     def stats(self) -> dict:
         with self._lock:

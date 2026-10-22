@@ -75,7 +75,7 @@ import hashlib
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
-from toolkit.basic import flush
+from toolkit.basic import flush, is_npu_available
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -2636,7 +2636,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
+                if "CUDA out of memory" in str(e) or "NPU out of memory" in str(e):
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors
@@ -2646,7 +2646,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
                 flush()
-                torch.cuda.ipc_collect()
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
@@ -2656,7 +2657,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             else:
                 self.num_consecutive_oom = 0
             if self.torch_profiler is not None:
-                torch.cuda.synchronize()  # Make sure all CUDA ops are done
+                if is_npu_available():
+                    torch.npu.synchronize()
+                else:
+                    torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
                 
                 print("\n==== Profile Results ====")

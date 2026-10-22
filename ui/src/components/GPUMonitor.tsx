@@ -1,13 +1,17 @@
 import React, { useMemo } from 'react';
 import Loading from '@/components/Loading';
 import GPUWidget from '@/components/GPUWidget';
+import NPUWidget from '@/components/NPUWidget';
 import useMonitorStream from '@/hooks/useMonitorStream';
 
 const GpuMonitor: React.FC = () => {
   // Live samples arrive every MONITOR_TICK_MS over the shared /api/monitor SSE stream
   const { gpu: gpuData, lastUpdated } = useMonitorStream();
   const loading = gpuData === null;
-  const error = null;
+  const gpus = useMemo(() => gpuData?.gpus ?? [], [gpuData]);
+  const npus = useMemo(() => gpuData?.npus ?? [], [gpuData]);
+  const hasGpus = gpus.length > 0;
+  const hasNpus = npus.length > 0;
 
   const getGridClasses = (gpuCount: number): string => {
     switch (gpuCount) {
@@ -33,68 +37,67 @@ const GpuMonitor: React.FC = () => {
     }
   };
 
-  console.log('state', {
-    loading,
-    gpuData,
-    error,
-    lastUpdated,
-  });
-
   const content = useMemo(() => {
     if (loading && !gpuData) {
       return <Loading />;
     }
 
-    if (error) {
-      return (
-        <div className="bg-red-900 border border-red-600 text-red-200 px-4 py-3 rounded relative" role="alert">
-          <strong className="font-bold">Error!</strong>
-          <span className="block sm:inline"> {error}</span>
-        </div>
-      );
-    }
-
     if (!gpuData) {
       return (
         <div className="bg-yellow-900 border border-yellow-700 text-yellow-300 px-4 py-3 rounded relative" role="alert">
-          <span className="block sm:inline">No GPU data available.</span>
+          <span className="block sm:inline">No accelerator data available.</span>
         </div>
       );
     }
 
-    if (!gpuData.hasNvidiaSmi && !gpuData.isMac) {
+    if (!hasGpus && !hasNpus) {
       return (
         <div className="bg-yellow-900 border border-yellow-700 text-yellow-300 px-4 py-3 rounded relative" role="alert">
-          <strong className="font-bold">No NVIDIA GPUs detected!</strong>
-          <span className="block sm:inline"> nvidia-smi is not available on this system.</span>
+          <strong className="font-bold">No NVIDIA GPU or Ascend NPU detected!</strong>
+          <span className="block sm:inline">
+            {' '}
+            Neither nvidia-smi nor npu-smi reported a usable device on this system.
+          </span>
           {gpuData.error && <p className="mt-2 text-sm">{gpuData.error}</p>}
+          {gpuData.npuError && <p className="mt-2 text-sm">{gpuData.npuError}</p>}
         </div>
       );
     }
 
-    if (gpuData.gpus.length === 0) {
-      return (
-        <div className="bg-yellow-900 border border-yellow-700 text-yellow-300 px-4 py-3 rounded relative" role="alert">
-          <span className="block sm:inline">No GPUs found, but nvidia-smi is available.</span>
-        </div>
-      );
-    }
-
-    const gridClass = getGridClasses(gpuData?.gpus?.length || 1);
+    const gridClass = getGridClasses(Math.max(gpus.length, npus.length, 1));
 
     return (
-      <div className={`grid ${gridClass} gap-3`}>
-        {gpuData.gpus.map((gpu, idx) => (
-          <GPUWidget key={idx} gpu={gpu} />
-        ))}
+      <div className="space-y-4">
+        {hasGpus && (
+          <div>
+            {hasNpus && <h2 className="text-sm text-gray-400 mb-2">NVIDIA GPU</h2>}
+            <div className={`grid ${gridClass} gap-3`}>
+              {gpus.map((gpu, idx) => (
+                <GPUWidget key={`gpu-${gpu.index}-${idx}`} gpu={gpu} />
+              ))}
+            </div>
+          </div>
+        )}
+        {hasNpus && (
+          <div>
+            {hasGpus && <h2 className="text-sm text-gray-400 mb-2">Ascend NPU</h2>}
+            <div className={`grid ${gridClass} gap-3`}>
+              {npus.map((npu, idx) => (
+                <NPUWidget key={`npu-${npu.cardId}-${npu.chipId}-${idx}`} npu={npu} />
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     );
-  }, [loading, gpuData, error]);
+  }, [loading, gpuData, hasGpus, hasNpus, gpus, npus]);
+
+  const title = hasNpus && !hasGpus ? 'NPU Monitor' : hasGpus && !hasNpus ? 'GPU Monitor' : 'Accelerator Monitor';
 
   return (
     <div className="w-full">
       <div className="flex justify-between items-center mb-2">
-        <h1 className="text-md">GPU Monitor</h1>
+        <h1 className="text-md">{title}</h1>
         <div className="text-xs text-gray-500">Last updated: {lastUpdated?.toLocaleTimeString()}</div>
       </div>
       {content}

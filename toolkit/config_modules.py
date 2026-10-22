@@ -1,16 +1,27 @@
 import os
+import shutil
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
 
 import torch
-import torchaudio
 
-from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
 ImgExt = Literal['jpg', 'png', 'webp']
+
+
+def _default_num_workers() -> int:
+    """Docker's default 64 MB /dev/shm cannot hold prefetched image batches;
+    use the main process there. Explicit dataset num_workers always wins."""
+    try:
+        if shutil.disk_usage('/dev/shm').total < 1024 ** 3:
+            return 0
+    except OSError:
+        pass
+    return 2
+
 
 SaveFormat = Literal['safetensors', 'diffusers']
 
@@ -1050,7 +1061,7 @@ class DatasetConfig:
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
 
-        self.num_workers: int = kwargs.get('num_workers', 2)
+        self.num_workers: int = kwargs.get('num_workers', _default_num_workers())
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
         # Pin DataLoader output tensors in page-locked RAM for faster CPU->GPU
         # transfer. Off by default because page-locked RAM cannot be relocated
@@ -1385,7 +1396,10 @@ class GenerateImageConfig:
             else:
                 raise ValueError(f"Unsupported video format {self.output_ext}")
         elif self.output_ext in ['wav', 'mp3', 'flac', 'ogg']:
-            # save audio file
+            # save audio file (torchaudio is optional: only audio models need it)
+            import torchaudio
+            from toolkit.audio.album_artwork import add_album_artwork
+
             audio_path = self.get_image_path(count, max_count)
             torchaudio.save(
                 audio_path, 

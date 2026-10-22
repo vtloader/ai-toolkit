@@ -21,6 +21,8 @@ from diffusers import (
     KDPM2AncestralDiscreteScheduler
 )
 import torch
+
+from toolkit.basic import is_npu_available
 import re
 from transformers import T5Tokenizer, T5EncoderModel, UMT5EncoderModel
 
@@ -110,6 +112,8 @@ def get_noise_from_latents(latents):
     for seed in seed_list:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
+        if is_npu_available():
+            torch.npu.manual_seed(seed)
         noise.append(torch.randn_like(latents[0]))
     return torch.stack(noise)
 

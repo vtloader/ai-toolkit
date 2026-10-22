@@ -441,6 +441,11 @@ class OstrisModelMixin:
             # to cpu against cuda activations). quantize_device carries the
             # actual gpu in the holder flow.
             compute_device = quantize_device if quantize_device is not None else device
+            if torch.device(compute_device).type == "npu":
+                raise NotImplementedError(
+                    "layer offloading uses CUDA streams/events and is not "
+                    "supported on NPU yet; set layer_offloading: false"
+                )
             MemoryManager.attach(
                 self,
                 torch.device(compute_device),

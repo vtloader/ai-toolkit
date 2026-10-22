@@ -129,7 +129,7 @@ function Card({
 function GeneratePageInner() {
   const searchParams = useSearchParams();
   const preferredJob = searchParams.get('job');
-  const { gpuList } = useGPUInfo();
+  const { acceleratorList } = useGPUInfo();
 
   // ---- engine lifecycle ----
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
@@ -195,8 +195,10 @@ function GeneratePageInner() {
   );
 
   useEffect(() => {
-    if (gpuList.length && !gpuList.some(g => `${g.index}` === gpuId)) setGpuId(`${gpuList[0].index}`);
-  }, [gpuList, gpuId]);
+    if (acceleratorList.length && !acceleratorList.some(a => a.id === gpuId)) {
+      setGpuId(acceleratorList[0].id);
+    }
+  }, [acceleratorList, gpuId]);
 
   const startEngine = async () => {
     setEngineBusy(true);
@@ -800,9 +802,9 @@ function GeneratePageInner() {
                       onChange={e => setGpuId(e.target.value)}
                       className="w-full bg-gray-800 text-gray-200 rounded-md px-3 py-2 border border-gray-700"
                     >
-                      {gpuList.map(g => (
-                        <option key={g.index} value={`${g.index}`}>
-                          GPU #{g.index} {g.name}
+                      {acceleratorList.map(accel => (
+                        <option key={accel.id} value={accel.id}>
+                          {accel.label}
                         </option>
                       ))}
                     </select>

@@ -13,9 +13,20 @@ def value_map(inputs, min_in, max_in, min_out, max_out):
     return (inputs - min_in) * (max_out - min_out) / (max_in - min_in) + min_out
 
 
-def flush(garbage_collect=True):
+def is_npu_available():
+    """True when torch_npu is installed and an Ascend device is usable."""
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def empty_device_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if is_npu_available():
+        torch.npu.empty_cache()
+
+
+def flush(garbage_collect=True):
+    empty_device_cache()
     # if is mps, also clear the mps cache
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()

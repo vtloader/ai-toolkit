@@ -1,14 +1,15 @@
 import math
 import torch
 import torch.nn.functional as F
-import torchaudio
-    
+
 def time_stretch_preserve_pitch(waveform: torch.Tensor, sample_rate: int, target_samples: int) -> torch.Tensor:
     """
     waveform: [C, L] float tensor (CPU or GPU)
     returns:  [C, target_samples] float tensor
     Pitch-preserving time stretch to match target_samples.
     """
+    # torchaudio is only needed for audio datasets (not installed everywhere)
+    import torchaudio
 
 
     if waveform.dim() == 1:

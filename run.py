@@ -3,6 +3,9 @@ import sys
 from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
+# Default to the Hugging Face mirror; an explicit HF_ENDPOINT (environment or
+# .env) still takes precedence. Must run before transformers/huggingface_hub.
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ["HF_XET_HIGH_PERFORMANCE"] = os.getenv("HF_XET_HIGH_PERFORMANCE", "1")
 os.environ["HF_HUB_DISABLE_XET"] = os.getenv("HF_HUB_DISABLE_XET", "0")
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
@@ -46,6 +49,8 @@ if seed is not None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
 
 import argparse
 from toolkit.job import get_job
