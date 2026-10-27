@@ -91,6 +91,9 @@ export interface GenerateDefaults {
   sample: { [key: string]: any };
   needsControlImage: boolean;
   sizeLocked: boolean;
+  /** sampler / scheduler dropdowns the Generate page should offer */
+  samplers?: SelectOption[];
+  schedulers?: SelectOption[];
   /** structured prompt fields (audio models): the prompt is their tagged form */
   sampleTags?: SampleTags;
 }
@@ -109,6 +112,10 @@ export interface ModelArch {
   defaults?: { [key: string]: any };
   disableSections?: DisableableSections[];
   additionalSections?: AdditionalSections[];
+  /** sampler dropdown entries; models opt in to extra samplers here */
+  samplers?: SelectOption[];
+  /** scheduler dropdown entries shown for samplers that need one */
+  schedulers?: SelectOption[];
   accuracyRecoveryAdapters?: { [key: string]: string };
   sampleTags?: SampleTags;
   gateUrl?: string;
@@ -197,7 +204,14 @@ const TRAINING_ONLY_MODEL_KEYS = new Set(['assistant_lora_path', 'unconditional_
 export const getGenerateDefaults = (arch: ModelArch): GenerateDefaults => {
   const defaults = arch.defaults || {};
   const model: { [key: string]: any } = {};
-  const sample: { [key: string]: any } = { width: 1024, height: 1024, num_inference_steps: 25, guidance_scale: 4 };
+  const sample: { [key: string]: any } = {
+    width: 1024,
+    height: 1024,
+    num_inference_steps: 25,
+    guidance_scale: 4,
+    sampler: 'flowmatch',
+    scheduler: 'normal',
+  };
   for (const [key, pair] of Object.entries(defaults)) {
     const value = Array.isArray(pair) ? pair[0] : pair;
     if (key.startsWith(MODEL_PREFIX)) {
@@ -216,13 +230,19 @@ export const getGenerateDefaults = (arch: ModelArch): GenerateDefaults => {
       if (sc.num_frames) sample.num_frames = sc.num_frames;
       if (sc.fps) sample.fps = sc.fps;
       if (sc.duration) sample.duration = sc.duration;
+      if (sc.sampler) sample.sampler = sc.sampler;
+      if (sc.scheduler) sample.scheduler = sc.scheduler;
       if (sc.neg) sample.negative_prompt = sc.neg;
     } else if (key.startsWith(SAMPLE_PREFIX + '.')) {
       const field = key.slice(SAMPLE_PREFIX.length + 1);
       if (value === undefined || value === null || value === '') continue;
       if (field === 'sample_steps') sample.num_inference_steps = value;
       else if (field === 'neg') sample.negative_prompt = value;
-      else if (['width', 'height', 'guidance_scale', 'num_frames', 'fps', 'duration'].includes(field))
+      else if (
+        ['width', 'height', 'guidance_scale', 'num_frames', 'fps', 'duration', 'sampler', 'scheduler'].includes(
+          field,
+        )
+      )
         sample[field] = value;
     }
   }
@@ -248,6 +268,8 @@ export const getGenerateDefaults = (arch: ModelArch): GenerateDefaults => {
     needsControlImage:
       gen.needsControlImage ?? (sections.includes('sample.ctrl_img') || sections.includes('sample.multi_ctrl_imgs')),
     sizeLocked: gen.sizeLocked ?? false,
+    samplers: arch.samplers,
+    schedulers: arch.schedulers,
     sampleTags: arch.sampleTags,
   };
 };

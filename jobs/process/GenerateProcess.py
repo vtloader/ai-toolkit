@@ -23,6 +23,7 @@ class GenerateConfig:
     def __init__(self, **kwargs):
         self.prompts: List[str]
         self.sampler = kwargs.get('sampler', 'ddpm')
+        self.scheduler = kwargs.get('scheduler', 'normal')
         self.width = kwargs.get('width', 512)
         self.height = kwargs.get('height', 512)
         self.size_list: Union[List[int], None] = kwargs.get('size_list', None)
@@ -161,7 +162,9 @@ class GenerateProcess(BaseProcess):
                         guidance_rescale=self.generate_config.guidance_rescale,
                         output_ext=self.generate_config.ext,
                         output_folder=self.output_folder,
-                        add_prompt_file=self.generate_config.prompt_file
+                        add_prompt_file=self.generate_config.prompt_file,
+                        sampler=self.generate_config.sampler,
+                        scheduler=self.generate_config.scheduler,
                     ))
             # generate images
             self.sd.generate_images(prompt_image_configs, sampler=self.generate_config.sampler)

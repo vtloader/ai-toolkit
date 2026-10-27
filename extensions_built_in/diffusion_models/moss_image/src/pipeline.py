@@ -1,9 +1,16 @@
 """MOSS-Image sampling (training previews / inference engine).
 
-Matches the vendor pipeline: shift-5 sigma grid snapped to the nearest of the
-1000 training sigmas, fp32 Euler on fp32 noise, CFG 3 whose negative branch
-skips DiT block 22 (two forwards per step), empty negative prompt. Flow
-convention is the toolkit's: sigma 1 = noise, the DiT predicts noise - clean.
+The default path matches the vendor pipeline: shift-5 sigma grid snapped to
+the nearest of the 1000 training sigmas, fp32 Euler on fp32 noise, CFG 3 whose
+negative branch skips DiT block 22 (two forwards per step), empty negative
+prompt. Flow convention is the toolkit's: sigma 1 = noise, the DiT predicts
+noise - clean.
+
+Setting sampler="dpmpp_2m" with scheduler="normal" switches to ComfyUI's
+native DPM-Solver++(2M) sampler and normal time-shift schedule. The sigma
+schedule and update are architecture independent (see
+toolkit.samplers.comfy_dpmpp_2m); only this pipeline's denoiser is MOSS
+specific.
 """
 
 from typing import List, Optional, Sequence
@@ -13,11 +20,15 @@ import torch.nn.functional as F
 from PIL import Image
 from diffusers.utils.torch_utils import randn_tensor
 
+from toolkit.samplers.comfy_dpmpp_2m import normal_sigmas, sample_dpmpp_2m
+
 DEFAULT_SHIFT = 5.0
 DEFAULT_GUIDANCE = 3.0
 DEFAULT_STEPS = 30
 DEFAULT_UNCOND_SKIP_LAYERS = (22,)
 NUM_TRAIN_TIMESTEPS = 1000
+DEFAULT_SAMPLER = "flowmatch"
+DEFAULT_SCHEDULER = "normal"
 
 
 def moss_sigmas(
@@ -97,6 +108,8 @@ class MossImagePipeline:
         uncond_skip_layers: Sequence[int] = DEFAULT_UNCOND_SKIP_LAYERS,
         ref_latents: Optional[List[List[torch.Tensor]]] = None,
         isolate_refs: bool = False,
+        sampler: str = DEFAULT_SAMPLER,
+        scheduler: str = DEFAULT_SCHEDULER,
         **kwargs,
     ):
         model = self.model
@@ -129,18 +142,23 @@ class MossImagePipeline:
             if isolate_refs:
                 cond_cache, uncond_cache = {}, {}
 
-        sigmas = moss_sigmas(num_inference_steps, shift=shift).to(device)
-        num_steps = len(sigmas) - 1
-        for step_index in range(num_steps):
-            sigma, sigma_next = sigmas[step_index], sigmas[step_index + 1]
+        sampler = str(sampler or DEFAULT_SAMPLER).lower()
+        scheduler = str(scheduler or DEFAULT_SCHEDULER).lower()
+
+        def predict(current, sigma):
             timestep = (sigma * NUM_TRAIN_TIMESTEPS).reshape(1)
             # CFG combines fp32 predictions even though the DiT runs in bf16
             pred = transformer(
-                latents, timestep, cond, cond_mask, ref_kv_cache=cond_cache, **ref_kwargs
+                current,
+                timestep,
+                cond,
+                cond_mask,
+                ref_kv_cache=cond_cache,
+                **ref_kwargs,
             ).float()
             if do_cfg:
                 pred_uncond = transformer(
-                    latents,
+                    current,
                     timestep,
                     uncond,
                     uncond_mask,
@@ -149,10 +167,43 @@ class MossImagePipeline:
                     **ref_kwargs,
                 ).float()
                 pred = pred_uncond + guidance_scale * (pred - pred_uncond)
-            if getattr(model, "sample_step_hook", None) is not None:
-                # inference engine preview: x0 estimate
-                model._emit_sample_step(latents - sigma * pred, step_index, num_steps)
-            latents = latents + (sigma_next - sigma) * pred
+            return pred
+
+        if sampler == "dpmpp_2m":
+            if scheduler != "normal":
+                raise ValueError(
+                    "MOSS-Image dpmpp_2m supports the 'normal' scheduler, "
+                    f"got {scheduler!r}"
+                )
+            sigmas = normal_sigmas(
+                num_inference_steps,
+                shift=shift,
+                num_train_timesteps=NUM_TRAIN_TIMESTEPS,
+                device=device,
+                dtype=torch.float32,
+            )
+            num_steps = len(sigmas) - 1
+
+            def denoise(current, sigma):
+                return current - sigma * predict(current, sigma)
+
+            def on_step(step_index, total_steps, denoised):
+                if getattr(model, "sample_step_hook", None) is not None:
+                    model._emit_sample_step(denoised, step_index, total_steps)
+
+            latents = sample_dpmpp_2m(latents, sigmas, denoise, callback=on_step)
+        else:
+            sigmas = moss_sigmas(num_inference_steps, shift=shift).to(device)
+            num_steps = len(sigmas) - 1
+            for step_index in range(num_steps):
+                sigma, sigma_next = sigmas[step_index], sigmas[step_index + 1]
+                pred = predict(latents, sigma)
+                if getattr(model, "sample_step_hook", None) is not None:
+                    # inference engine preview: x0 estimate
+                    model._emit_sample_step(
+                        latents - sigma * pred, step_index, num_steps
+                    )
+                latents = latents + (sigma_next - sigma) * pred
 
         images = model.decode_latents(latents, device=device, dtype=torch.float32)
         images = images.float().clamp(-1.0, 1.0)

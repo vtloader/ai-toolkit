@@ -24,11 +24,14 @@ from ..embeddings import TimestepEmbedding
 
 from ...utils.import_utils import is_flash_attn_available, is_triton_available
 
-if is_triton_available():
+# The fused implementation uses CUDA-only device queries during module import.
+# Keep that path for CUDA, while NPU and CPU use PyTorch's portable RMSNorm.
+if is_triton_available() and torch.cuda.is_available():
     from ...ops.triton.layer_norm import RMSNorm
 else:
     from torch.nn import RMSNorm
-    warnings.warn("Cannot import triton, install triton to use fused RMSNorm for better performance")
+    if torch.cuda.is_available() and not is_triton_available():
+        warnings.warn("Cannot import triton, install triton to use fused RMSNorm for better performance")
     
 if is_flash_attn_available():
     from flash_attn.ops.activations import swiglu

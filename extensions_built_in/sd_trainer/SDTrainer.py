@@ -36,6 +36,11 @@ from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
+from toolkit.tensor_parallel import (
+    is_tp_enabled,
+    tp_clip_grad_norm_,
+    tp_sync_replicated_grads,
+)
 from toolkit.util.losses import wavelet_loss, stepped_loss, band_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
@@ -1259,8 +1264,6 @@ class SDTrainer(BaseSDTrainProcess):
             pure_loss.requires_grad_(True)
 
         loss = loss.mean()
-        if loss.item() > 1e3:
-            pass
         self.accelerator.backward(loss)
         return pure_loss
 
@@ -2378,8 +2381,13 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
-            # fix this for multi params
-            if self.train_config.optimizer != 'adafactor':
+            # TP: replicated adapter params hold partial grads (sum them);
+            # then clip with one global norm computed across shards.
+            if is_tp_enabled():
+                tp_sync_replicated_grads(self.network)
+                if self.train_config.optimizer != 'adafactor':
+                    tp_clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+            elif self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
                     for i in range(len(self.params)):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)

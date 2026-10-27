@@ -37,6 +37,9 @@ export default function TrainingForm() {
 
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
+  const tpSize = Number(
+    (jobConfig.config.process[0].train as any)?.tensor_parallel_size || 1,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleImportConfig = () => {
@@ -152,11 +155,29 @@ export default function TrainingForm() {
     if (status === 'saving') return;
     setStatus('saving');
 
+    // TP jobs need one device id per rank; use the selected NPUs first, then
+    // fill from the remaining visible NPUs.
+    let effectiveGpuIds = gpuIDs;
+    if (tpSize > 1) {
+      const npus = acceleratorList.filter(accel => accel.vendor === 'npu').map(accel => accel.id);
+      if (npus.length < tpSize) {
+        alert(`Tensor parallel needs ${tpSize} NPUs, but only ${npus.length} are visible.`);
+        setStatus('idle');
+        return;
+      }
+      const selected = (gpuIDs || '')
+        .split(',')
+        .map(id => id.trim())
+        .filter(id => npus.includes(id));
+      const ordered = [...selected, ...npus.filter(id => !selected.includes(id))];
+      effectiveGpuIds = ordered.slice(0, tpSize).join(',');
+    }
+
     apiClient
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
-        gpu_ids: gpuIDs,
+        gpu_ids: effectiveGpuIds,
         job_config: jobConfig,
       })
       .then(res => {
@@ -203,13 +224,15 @@ export default function TrainingForm() {
         <div className="flex-1"></div>
         {showAdvancedView && (
           <>
-            <div className="hidden sm:block">
-              <SelectInput
-                value={`${gpuIDs}`}
-                onChange={value => setGpuIDs(value)}
-                options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
-              />
-            </div>
+            {tpSize <= 1 && (
+              <div className="hidden sm:block">
+                <SelectInput
+                  value={`${gpuIDs}`}
+                  onChange={value => setGpuIDs(value)}
+                  options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
+                />
+              </div>
+            )}
             <div className="hidden sm:block mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
             <div className="hidden md:block">
               <Button className="text-gray-200 bg-gray-800 px-3 py-1 rounded-md" onClick={handleImportConfig}>

@@ -1274,6 +1274,33 @@ function GeneratePageInner() {
                       min={1}
                       max={200}
                     />
+                    {modality !== 'audio' && (
+                      <SelectInput
+                        label="Sampler"
+                        value={sample.sampler ?? 'flowmatch'}
+                        onChange={v =>
+                          setSample(s => ({
+                            ...s,
+                            sampler: v,
+                            scheduler: v === 'dpmpp_2m' ? s.scheduler || 'normal' : s.scheduler,
+                          }))
+                        }
+                        options={
+                          entry?.samplers ?? [
+                            { value: 'flowmatch', label: 'FlowMatch' },
+                            { value: 'ddpm', label: 'DDPM' },
+                          ]
+                        }
+                      />
+                    )}
+                    {modality !== 'audio' && sample.sampler === 'dpmpp_2m' && (
+                      <SelectInput
+                        label="Scheduler"
+                        value={sample.scheduler ?? 'normal'}
+                        onChange={v => setSample(s => ({ ...s, scheduler: v }))}
+                        options={entry?.schedulers ?? [{ value: 'normal', label: 'Normal' }]}
+                      />
+                    )}
                     <NumberInput
                       label="Guidance"
                       value={sample.guidance_scale ?? 4}

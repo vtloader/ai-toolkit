@@ -281,6 +281,7 @@ export interface SampleItem {
 
 export interface SampleConfig {
   sampler: string;
+  scheduler?: string;
   sample_every: number;
   sample_start_step: number;
   width: number;

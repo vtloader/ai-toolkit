@@ -12,6 +12,16 @@ import {
 const defaultNameOrPath = "";
 const defaultLinearRank = 32;
 
+// MOSS-Image's native sampler plus ComfyUI's DPM-Solver++(2M). DDPM is kept
+// for configs that selected it before this option existed (MOSS samples with
+// the vendor Euler path for it); "normal" is paired with dpmpp_2m.
+const mossImageSamplers = [
+  { value: "flowmatch", label: "FlowMatch" },
+  { value: "ddpm", label: "DDPM" },
+  { value: "dpmpp_2m", label: "DPM++ 2M" },
+];
+const mossImageSchedulers = [{ value: "normal", label: "Normal" }];
+
 // MOSS-Image edit LoRAs need the companion custom nodes in ComfyUI
 const mossImageEditNotes = (
   <p>
@@ -1986,6 +1996,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     name: "moss_image",
     label: "MOSS-Image SFT",
     group: "image",
+    samplers: mossImageSamplers,
+    schedulers: mossImageSchedulers,
     defaults: {
       // default updates when [selected, unselected] in the UI
       // the vendor repo: its transformer is merged once into the comfy models
@@ -2030,6 +2042,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     label: "MOSS-Image Base",
     generateNameOverride: "MOSS-Image Base",
     group: "image",
+    samplers: mossImageSamplers,
+    schedulers: mossImageSchedulers,
     defaults: {
       // default updates when [selected, unselected] in the UI
       // the vendor repo: Comfy-Org/MOSS-Image base files on disk win, else the
@@ -2075,6 +2089,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     generateNameOverride: "MOSS-Image SFT Edit",
     group: "experimental",
     modelNotes: mossImageEditNotes,
+    samplers: mossImageSamplers,
+    schedulers: mossImageSchedulers,
     defaults: {
       // default updates when [selected, unselected] in the UI
       "config.process[0].model.name_or_path": [
@@ -2129,6 +2145,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     generateNameOverride: "MOSS-Image Base Edit",
     group: "experimental",
     modelNotes: mossImageEditNotes,
+    samplers: mossImageSamplers,
+    schedulers: mossImageSchedulers,
     defaults: {
       // default updates when [selected, unselected] in the UI
       "config.process[0].model.name_or_path": [

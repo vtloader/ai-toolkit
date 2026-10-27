@@ -21,7 +21,6 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
-  console.log('job.gpu_ids', job.gpu_ids);
   const { gpuList, npuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
@@ -160,8 +159,20 @@ export default function JobOverview({ job }: JobOverviewProps) {
       {/* GPU Widget Panel */}
       <div className="md:col-span-1">
         <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
-        <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
-        <div className="mt-4">{isGPUInfoLoaded && npuList.length > 0 && <NPUWidget npu={npuList[0]} />}</div>
+        {isGPUInfoLoaded && gpuList.length > 0 && (
+          <div className="mt-4 space-y-3">
+            {gpuList.map(gpu => (
+              <GPUWidget key={`gpu-${gpu.index}`} gpu={gpu} />
+            ))}
+          </div>
+        )}
+        {isGPUInfoLoaded && npuList.length > 0 && (
+          <div className="mt-4 space-y-3">
+            {npuList.map(npu => (
+              <NPUWidget key={`npu-${npu.cardId}-${npu.chipId}`} npu={npu} />
+            ))}
+          </div>
+        )}
         {jobType === 'train' && (
           <div className="mt-4">
             <FilesWidget jobID={job.id} jobName={job.name} />

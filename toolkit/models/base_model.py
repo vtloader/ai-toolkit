@@ -522,6 +522,10 @@ class BaseModel:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
                     gen_config = image_configs[i]
+                    # legacy callers pass the sampler as an argument; expose it
+                    # on the config so any model can opt in to a sampler choice
+                    if getattr(gen_config, "sampler", None) is None and sampler is not None:
+                        gen_config.sampler = sampler
 
                     extra = {}
                     validation_image = None

@@ -18,6 +18,7 @@ K/V can be cached across sampling steps.
 """
 
 import os
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -27,6 +28,11 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+from toolkit.tensor_parallel import (
+    is_tp_enabled,
+    tp_all_reduce_backward,
+    tp_all_reduce_forward,
+)
 
 # NPU-only fast paths; the env switch exists for A/B benchmarking and debugging.
 # Default ("all") enables every fusion; "none" restores the portable path.
@@ -41,6 +47,44 @@ def _parse_fusions():
 
 _NPU_FUSIONS = _parse_fusions()
 _NPU_RMS_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_NPU_FALLBACKS = {
+    "rms": set(),
+    "rope": set(),
+    "attention": set(),
+}
+_NPU_FALLBACK_COUNTS = Counter()
+_NPU_DEBUG = os.environ.get("AITK_MOSS_NPU_DEBUG", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+# CANN's fused attention wants True = masked and a full [B, 1, Sq, Skv] mask.
+# Inverting the tiny [B, 1, 1, S] validity mask once per forward (instead of
+# once per block) avoids 42 x S^2 bool materializations per fwd/recompute.
+_MASK_PRECOMPUTE = os.environ.get("AITK_MOSS_MASK_PRECOMPUTE", "1") != "0"
+
+
+def _shape_key(*values):
+    """Build a small, hashable key for a native-op capability decision."""
+    def normalize(value):
+        if isinstance(value, torch.Tensor):
+            return (tuple(value.shape), str(value.dtype), value.device.type)
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, (tuple, list)):
+            return tuple(normalize(item) for item in value)
+        return value
+
+    return tuple(normalize(value) for value in values)
+
+
+def _native_fallback(kind, key, error=None):
+    """Remember unsupported shapes so failed CANN launches are not retried."""
+    fallbacks = _NPU_FALLBACKS[kind]
+    first_failure = key not in fallbacks
+    fallbacks.add(key)
+    _NPU_FALLBACK_COUNTS[kind] += 1
+    if _NPU_DEBUG and first_failure:
+        detail = f" ({type(error).__name__}: {error})" if error is not None else ""
+        print(f"MOSS NPU {kind} fallback cached for shape key {key}{detail}")
 
 
 def _npu_ops():
@@ -79,12 +123,13 @@ class _RMSNorm(nn.Module):
             and x.shape[-1] == self.weight.numel()
         ):
             npu = _npu_ops()
-            if npu is not None:
+            key = _shape_key(x, self.weight)
+            if npu is not None and key not in _NPU_FALLBACKS["rms"]:
                 try:
                     # fused rmsnorm (fp32 internal math, gamma folded in)
                     return npu.npu_rms_norm(x, self.weight, 1e-6)[0]
-                except Exception:
-                    pass
+                except Exception as error:
+                    _native_fallback("rms", key, error)
         y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
         return y.to(x.dtype) * self.weight
 
@@ -114,12 +159,13 @@ def _rotate(x, rope, cos_sin=None):
     sin, cos = cos_sin
     if "rope" in _NPU_FUSIONS and x.device.type == "npu" and x.dim() == 4:
         npu = _npu_ops()
-        if npu is not None and x.dtype in _NPU_RMS_DTYPES:
+        key = _shape_key(x, cos, sin)
+        if npu is not None and x.dtype in _NPU_RMS_DTYPES and key not in _NPU_FALLBACKS["rope"]:
             try:
                 # half-mode rotary matches the cos/sin layout built above
                 return npu.npu_rotary_mul(x, cos, sin)
-            except Exception:
-                pass
+            except Exception as error:
+                _native_fallback("rope", key, error)
     a, b = x.chunk(2, -1)
     return x * cos + torch.cat((-b, a), -1) * sin
 
@@ -136,15 +182,17 @@ def _sdpa_mask(mask, q, k):
     return mask.expand(*mask.shape[:-2], sq, skv)
 
 
-def _fused_attention(npu, q, k, v, heads, scale, mask):
+def _fused_attention(npu, q, k, v, heads, scale, mask, atten_mask=None):
     # BSND keeps the sequence-major layout: no transposes around attention.
+    if atten_mask is None and mask is not None:
+        atten_mask = ~mask
     return npu.npu_fusion_attention(
         q,
         k,
         v,
         heads,
         "BSND",
-        atten_mask=~mask if mask is not None else None,
+        atten_mask=atten_mask,
         scale=scale,
         pre_tockens=65536,
         next_tockens=65536,
@@ -154,7 +202,17 @@ def _fused_attention(npu, q, k, v, heads, scale, mask):
 
 
 def _attention_npu(
-    q, k, v, rope, heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+    q,
+    k,
+    v,
+    rope,
+    heads,
+    mask,
+    ref_span,
+    kv_capture,
+    kv_cache,
+    isolate_split,
+    precomputed_mask=None,
 ):
     """CANN fused attention on BSND tensors. Returns None when unsupported so
     the caller can fall back to the portable SDPA path."""
@@ -173,18 +231,29 @@ def _attention_npu(
     npu = _npu_ops()
     if npu is None:
         return None
+    fallback_key = _shape_key(
+        q,
+        k,
+        v,
+        rope,
+        heads,
+        mask,
+        isolate_split,
+    )
+    if fallback_key in _NPU_FALLBACKS["attention"]:
+        return None
     shape = (*q.shape[:2], heads, head_dim)
     try:
         cos_sin = rope if isinstance(rope, tuple) else _rope_cos_sin(rope)
         q = _rotate(q.reshape(shape), rope, cos_sin)
         k = _rotate(k.reshape(shape), rope, cos_sin)
         v = v.reshape(shape)
-        attn_mask = None
-        if mask is not None:
+        fused_mask = precomputed_mask
+        if fused_mask is None and mask is not None:
             sq, skv = q.shape[1], k.shape[1]
             if mask.shape[-2:] != (sq, skv):
                 mask = mask.expand(*mask.shape[:-2], sq, skv)
-            attn_mask = mask
+            fused_mask = ~mask
         captured = None
         if kv_capture is not None:
             captured = tuple(
@@ -197,7 +266,9 @@ def _attention_npu(
         q, k = q.to(v.dtype), k.to(v.dtype)
         scale = head_dim**-0.5
         if isolate_split is not None:
-            live = _fused_attention(npu, q[:, :isolate_split], k, v, heads, scale, attn_mask)
+            live = _fused_attention(
+                npu, q[:, :isolate_split], k, v, heads, scale, None, fused_mask
+            )
             ref = _fused_attention(
                 npu,
                 q[:, isolate_split:],
@@ -206,11 +277,13 @@ def _attention_npu(
                 heads,
                 scale,
                 None,
+                None,
             )
             out = torch.cat((live, ref), 1)
         else:
-            out = _fused_attention(npu, q, k, v, heads, scale, attn_mask)
-    except Exception:
+            out = _fused_attention(npu, q, k, v, heads, scale, None, fused_mask)
+    except Exception as error:
+        _native_fallback("attention", fallback_key, error)
         return None
     if captured is not None:
         kv_capture.append(captured)
@@ -218,11 +291,31 @@ def _attention_npu(
 
 
 def _attention(
-    q, k, v, rope, heads, mask, ref_span=None, kv_capture=None, kv_cache=None, isolate_split=None
+    q,
+    k,
+    v,
+    rope,
+    heads,
+    mask,
+    ref_span=None,
+    kv_capture=None,
+    kv_cache=None,
+    isolate_split=None,
+    precomputed_mask=None,
 ):
     if "attn" in _NPU_FUSIONS and q.device.type == "npu":
         out = _attention_npu(
-            q, k, v, rope, heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+            q,
+            k,
+            v,
+            rope,
+            heads,
+            mask,
+            ref_span,
+            kv_capture,
+            kv_cache,
+            isolate_split,
+            precomputed_mask,
         )
         if out is not None:
             return out
@@ -276,11 +369,15 @@ class _TextBlock(nn.Module):
         self.ffn_gate, self.ffn_up = nn.Linear(dim, ffn_dim), nn.Linear(dim, ffn_dim)
         self.ffn_down = nn.Linear(ffn_dim, dim)
 
-    def forward(self, x, rope, mask):
+    def forward(self, x, rope, mask, precomputed_mask=None):
         q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads, mask))
+        x = x + self.proj(
+            _attention(
+                q, k, v, rope, self.heads, mask, precomputed_mask=precomputed_mask
+            )
+        )
         y = self.norm2(x)
         return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
 
@@ -310,7 +407,16 @@ class _Block(nn.Module):
         )
 
     def forward(
-        self, x, rope, modulation, mask, isolate_split=None, ref_span=None, kv_capture=None, kv_cache=None
+        self,
+        x,
+        rope,
+        modulation,
+        mask,
+        isolate_split=None,
+        ref_span=None,
+        kv_capture=None,
+        kv_cache=None,
+        precomputed_mask=None,
     ):
         # modulation (B, 6, D) [shift_a, scale_a, gate_a, shift_f, scale_f,
         # gate_f], or (mod, ref_mod, split): tokens [split:] are clean
@@ -343,16 +449,39 @@ class _Block(nn.Module):
                 return h * m[g][:, None]
 
         y = affine(self.norm1(x), 1, 0)
+        if is_tp_enabled():
+            # column parallel: the replicated input's gradient is the sum of
+            # every rank's partial contribution
+            y = tp_all_reduce_backward(y)
         q, k, v = self.proj["qkv"](y).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
         attn = _attention(
-            q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+            q,
+            k,
+            v,
+            rope,
+            self.heads,
+            mask,
+            ref_span,
+            kv_capture,
+            kv_cache,
+            isolate_split,
+            precomputed_mask,
         )
-        x = x + gate(self.proj["o"](attn), 2)
+        out = self.proj["o"](attn)
+        if is_tp_enabled():
+            # row parallel: each rank holds a partial product (base + LoRA)
+            out = tp_all_reduce_forward(out)
+        x = x + gate(out, 2)
         y = affine(self.norm2(x), 4, 3)
+        if is_tp_enabled():
+            y = tp_all_reduce_backward(y)
         hidden, ffn_gate = self.proj["ffn_up_gate"](y).chunk(2, -1)
-        return x + gate(self.proj["ffn_down"](_situ(hidden, ffn_gate)), 5)
+        down = self.proj["ffn_down"](_situ(hidden, ffn_gate))
+        if is_tp_enabled():
+            down = tp_all_reduce_forward(down)
+        return x + gate(down, 5)
 
 
 class MossImageTransformer(nn.Module, OstrisModelMixin):
@@ -446,7 +575,9 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
 
     def _ckpt(self, module, *args):
         if self.gradient_checkpointing and torch.is_grad_enabled():
-            return checkpoint(module, *args, use_reentrant=False)
+            # MOSS blocks have no dropout, so replaying them does not need the
+            # RNG state saved/restored per block.
+            return checkpoint(module, *args, use_reentrant=False, preserve_rng_state=False)
         return module(*args)
 
     def _rope_from_coords(self, coords):
@@ -628,12 +759,27 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         elif padded:
             joint_mask = live_valid[:, None, None, :]
 
+        # CANN fused attention takes True = masked; build the S x S attention
+        # mask once per forward so all blocks (and checkpoint recomputes) reuse
+        # it instead of materializing ~S^2 bool 42 times.
+        text_attn_mask = None
+        if _MASK_PRECOMPUTE and text_mask is not None:
+            text_attn_mask = (
+                (~text_mask).expand(batch, 1, text_len, text_len).contiguous()
+            )
+        joint_attn_mask = None
+        if _MASK_PRECOMPUTE and joint_mask is not None:
+            seq = joint_mask.shape[-1]
+            joint_attn_mask = (
+                (~joint_mask).expand(batch, 1, seq, seq).contiguous()
+            )
+
         video = hidden_states.flatten(2).transpose(1, 2).to(dtype)
         video = self.video_embedder(video.contiguous())
         text = self.text_embedder.proj(context.to(dtype))
         text_rope = _rope_slice(rope, num_image, num_live)
         for block in self.text_embedder.blocks:
-            text = self._ckpt(block, text, text_rope, text_mask)
+            text = self._ckpt(block, text, text_rope, text_mask, text_attn_mask)
 
         parts = [video, text]
         if num_ref:
@@ -648,14 +794,38 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
             if capture:
                 slot = []
                 x = layer(
-                    x, rope, modulation, joint_mask, isolate_split,
-                    (num_live, num_live + num_ref), slot,
+                    x,
+                    rope,
+                    modulation,
+                    joint_mask,
+                    isolate_split,
+                    (num_live, num_live + num_ref),
+                    slot,
+                    precomputed_mask=joint_attn_mask,
                 )
                 captured[index] = slot[0]
             elif reuse_refs:
-                x = layer(x, rope, modulation, joint_mask, kv_cache=ref_kv_cache["kv"][index])
+                x = layer(
+                    x,
+                    rope,
+                    modulation,
+                    joint_mask,
+                    kv_cache=ref_kv_cache["kv"][index],
+                    precomputed_mask=joint_attn_mask,
+                )
             else:
-                x = self._ckpt(layer, x, rope, modulation, joint_mask, isolate_split)
+                x = self._ckpt(
+                    layer,
+                    x,
+                    rope,
+                    modulation,
+                    joint_mask,
+                    isolate_split,
+                    None,
+                    None,
+                    None,
+                    joint_attn_mask,
+                )
         if capture:
             ref_kv_cache["kv"] = captured
             ref_kv_cache["mask"] = ref_valid

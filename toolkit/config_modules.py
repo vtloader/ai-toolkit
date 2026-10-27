@@ -92,6 +92,8 @@ class SampleItem:
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
+        # sigma schedule / sampler variant; currently "normal" for dpmpp_2m
+        self.scheduler: str = kwargs.get('scheduler', 'normal')
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.sample_start_step: int = kwargs.get('sample_start_step', 0)
         self.width: int = kwargs.get('width', 512)
@@ -392,6 +394,9 @@ class TrainConfig:
         self.content_or_style: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.steps: int = kwargs.get('steps', 1000)
+        # >1 runs the MOSS transformer with Megatron-style tensor parallelism
+        # (requires torchrun with one process per NPU; see startJob.ts)
+        self.tensor_parallel_size: int = int(kwargs.get('tensor_parallel_size', 1) or 1)
         self.lr = kwargs.get('lr', 1e-6)
         self.unet_lr = kwargs.get('unet_lr', self.lr)
         self.text_encoder_lr = kwargs.get('text_encoder_lr', self.lr)
@@ -1074,6 +1079,10 @@ class DatasetConfig:
         self.batch_load_threads: int = kwargs.get('batch_load_threads', min(8, os.cpu_count() or 1))
         # threads used to prep (decode/resize) items ahead of the VAE while caching latents
         self.cache_latents_num_workers: int = kwargs.get('cache_latents_num_workers', min(6, os.cpu_count() or 1))
+        # Keep bucketed batches ordered by latent area while shuffling within an
+        # area group. This reduces accelerator shape switching for workloads
+        # with many resolutions without changing the samples inside a bucket.
+        self.stable_bucket_order: bool = kwargs.get('stable_bucket_order', False)
         self.extra_values: List[float] = kwargs.get('extra_values', [])
         self.square_crop: bool = kwargs.get('square_crop', False)
         # apply same augmentations to control images. Usually want this true unless special case
@@ -1196,12 +1205,18 @@ class GenerateImageConfig:
             duration: Optional[float] = None,  # audio models: max seconds
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            sampler: Optional[str] = None,  # sampler name (model specific)
+            scheduler: Optional[str] = None,  # sigma schedule (model specific)
+            save_to_disk: bool = True,  # TP: only rank 0 writes the sample
     ):
         self.width: int = width
         self.height: int = height
         self.num_inference_steps: int = num_inference_steps
         self.guidance_scale: float = guidance_scale
         self.guidance_rescale: float = guidance_rescale
+        self.sampler: Optional[str] = sampler
+        self.scheduler: Optional[str] = scheduler
+        self.save_to_disk: bool = save_to_disk
         self.prompt: str = prompt
         self.prompt_2: str = prompt_2
         self.negative_prompt: str = negative_prompt
@@ -1301,6 +1316,9 @@ class GenerateImageConfig:
         return os.path.join(self.output_folder, filename)
 
     def save_image_atomic(self, image, count: int = 0, max_count=0):
+        # TP ranks other than rank 0 only participate in the model forwards.
+        if not getattr(self, "save_to_disk", True):
+            return
         # write into a hidden tmp subfolder, then atomically move into place so
         # watchers (UI/CDN) never see and cache a partially written file. Wraps
         # self.save_image so it also covers models that replace that function.
@@ -1538,6 +1556,8 @@ class GenerateImageConfig:
         pass
     
     def log_image(self, image, count: int = 0, max_count=0):
+        if not getattr(self, "save_to_disk", True):
+            return
         if self.logger is None or isinstance(image, str):
             return
 

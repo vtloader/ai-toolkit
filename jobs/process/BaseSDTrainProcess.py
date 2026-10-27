@@ -57,6 +57,15 @@ from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
+from toolkit.tensor_parallel import (
+    apply_tensor_parallel,
+    is_tp_enabled,
+    tp_clip_grad_norm_,
+    tp_reshard_network,
+    tp_sync_replicated_grads,
+    tp_unshard_network,
+    tp_world_size,
+)
 import gc
 
 from tqdm import tqdm
@@ -117,6 +126,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         model_config['dtype'] = self.train_config.dtype
         self.model_config = ModelConfig(**model_config)
 
+        if self.train_config.tensor_parallel_size > 1 and not is_tp_enabled():
+            raise RuntimeError(
+                "tensor_parallel_size > 1 requires launching through the TP "
+                "launcher (torchrun with AITK_TP=1), not plain run.py."
+            )
+        if is_tp_enabled():
+            if not str(self.model_config.arch).startswith("moss_image"):
+                raise NotImplementedError(
+                    "Tensor parallelism is currently implemented for moss_image only "
+                    f"(got arch={self.model_config.arch})."
+                )
+            if self.train_config.tensor_parallel_size > 1 and (
+                self.train_config.tensor_parallel_size != tp_world_size()
+            ):
+                raise RuntimeError(
+                    f"Config tensor_parallel_size={self.train_config.tensor_parallel_size} "
+                    f"does not match the launched world size {tp_world_size()}."
+                )
+
         self.save_config = SaveConfig(**self.get_conf('save', {}))
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))
         first_sample_config = self.get_conf('first_sample', None)
@@ -128,6 +156,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.first_sample_config = self.sample_config
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
+        if is_tp_enabled():
+            # Sampling can join the TP collectives when every rank runs the
+            # same prompts, so previews are allowed; validation is a separate
+            # rank-0-only path and stays disabled.
+            print_acc(
+                "TP: sampling runs on all ranks; validation is disabled while "
+                "the model is sharded."
+            )
+            if hasattr(self.train_config, "validation_config"):
+                self.train_config.validation_config = None
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
         self.data_loader: Union[DataLoader, None] = None
@@ -280,7 +318,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
-        if not self.accelerator.is_main_process:
+        # TP needs every rank in the sampling forward for the tensor-parallel
+        # collectives; rank 0 still owns the image write.
+        if not self.accelerator.is_main_process and not is_tp_enabled():
             return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
@@ -361,6 +401,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_2=sample_item.ctrl_img_2,
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
+                sampler=sample_config.sampler,
+                scheduler=getattr(sample_config, "scheduler", None),
+                save_to_disk=(not is_tp_enabled()) or self.accelerator.is_main_process,
                 **extra_args
             ))
 
@@ -504,6 +547,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def save(self, step=None):
+        """Gather TP shards so rank 0 writes a normal full LoRA file."""
+        tp = is_tp_enabled()
+        if tp:
+            import torch.distributed as dist
+
+            if self.network is None:
+                raise RuntimeError(
+                    "TP checkpoint saving currently supports LoRA training only"
+                )
+            tp_unshard_network(self.network)
+        try:
+            self._save_impl(step)
+        finally:
+            if tp:
+                dist.barrier()
+                tp_reshard_network(self.network)
+
+    def _save_impl(self, step=None):
         if not self.accelerator.is_main_process:
             return
         flush()
@@ -700,7 +761,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         print_acc(f"Saved checkpoint to {file_path}")
 
         # save optimizer
-        if self.optimizer is not None:
+        if self.optimizer is not None and not is_tp_enabled():
             try:
                 filename = f'optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
@@ -745,13 +806,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def prepare_accelerator(self):
         # set some config
         self.accelerator.even_batches=False
+        tp = is_tp_enabled()
+        unsupported = []
+        if tp and self.train_config.train_text_encoder and self.sd.text_encoder is not None:
+            unsupported.append("text encoder")
+        if tp and self.train_config.train_refiner and self.sd.refiner_unet is not None:
+            unsupported.append("refiner")
+        if (
+            tp
+            and self.adapter is not None
+            and self.adapter_config is not None
+            and self.adapter_config.train
+        ):
+            unsupported.append("adapter")
+        if unsupported:
+            raise NotImplementedError(
+                "TP currently supports LoRA training of the MOSS transformer only "
+                f"(requested: {', '.join(unsupported)})."
+            )
         
-        # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        if self.sd.vae is not None:
+        # Model wrapping must be skipped under TP: accelerate would wrap the
+        # sharded module in DDP and add a second, wrong gradient sync.
+        if self.sd.vae is not None and not tp:
             self.sd.vae = self.accelerator.prepare(self.sd.vae)
         if self.sd.unet is not None:
-            self.sd.unet = self.accelerator.prepare(self.sd.unet)
-            # todo always tdo it?
+            if not tp:
+                self.sd.unet = self.accelerator.prepare(self.sd.unet)
             self.modules_being_trained.append(self.sd.unet)
         if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
@@ -765,7 +845,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.modules_being_trained.append(self.sd.refiner_unet)
         # todo, do we need to do the network or will "unet" get it?
         if self.sd.network is not None:
-            self.sd.network = self.accelerator.prepare(self.sd.network)
+            if not tp:
+                self.sd.network = self.accelerator.prepare(self.sd.network)
             self.modules_being_trained.append(self.sd.network)
         if self.adapter is not None and self.adapter_config.train:
             # todo adapters may not be a module. need to check
@@ -868,8 +949,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
+        # Every TP rank must resume at the same step: a main-only update makes
+        # the other ranks train from zero and hang the final save barrier.
         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
             # dont load metadata from pretrained lora
             return
@@ -893,7 +974,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def load_weights(self, path):
         if self.network is not None:
-            extra_weights = self.network.load_weights(path)
+            # Checkpoints store the full adapter. Under TP the live adapter is
+            # sharded, so gather it before the shape-checked load and restore
+            # this rank's shards afterwards.
+            tp = is_tp_enabled()
+            if tp:
+                tp_unshard_network(self.network)
+            try:
+                extra_weights = self.network.load_weights(path)
+            finally:
+                if tp:
+                    tp_reshard_network(self.network)
             self.load_training_state_from_metadata(path)
             return extra_weights
         else:
@@ -1971,6 +2062,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.train_config.train_unet
                 )
 
+                if is_tp_enabled():
+                    # Shard the projection weights and adapters before the
+                    # optimizer is built (param shapes must be final).
+                    apply_tensor_parallel(unet, self.network)
+
                 # we cannot merge in if quantized or offloading. note: torchao quantized weights can
                 # still be force merged at save time for the merge-and-reset method (see save logic),
                 # but we keep can_merge_in False here so sampling never merges in/out.
@@ -2168,7 +2264,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if os.path.exists(optimizer_state_file_path):
+        if is_tp_enabled() and os.path.exists(optimizer_state_file_path):
+            print_acc(
+                "TP: skipping optimizer state; TP checkpoints do not store "
+                "sharded optimizer state"
+            )
+        if os.path.exists(optimizer_state_file_path) and not is_tp_enabled():
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
@@ -2829,7 +2930,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
-        if self.accelerator.is_main_process:
+        # Under TP every rank must join the save gather; _save_impl itself
+        # keeps the file write on rank 0.
+        if is_tp_enabled() or self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)

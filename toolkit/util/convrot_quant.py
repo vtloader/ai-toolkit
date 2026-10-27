@@ -43,6 +43,7 @@ Quantized state attached to each module:
   cr_rot / module.cr_rot_size  rotation block size
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -1084,7 +1085,13 @@ def _int8_gemm_supported(device) -> bool:
     global _warned_no_int8
     if not supported and not _warned_no_int8:
         _warned_no_int8 = True
-        if _mps_int8pack_device_ok(device):
+        if _npu_int8_supported(device):
+            print_acc(
+                "ConvRot: using Ascend int8 tensor cores (npu_quant_matmul) for "
+                "W8A8 on this device; activations and weights stay quantized and "
+                "no dequantized bf16 weight is built on the hot path."
+            )
+        elif _mps_int8pack_device_ok(device):
             print_acc(
                 f"ConvRot: int8 tensor-core matmul (torch._int_mm) is not implemented "
                 f"on this device ({device}). Inference uses torch._weight_int8pack_mm "
@@ -1301,6 +1308,154 @@ def _dequant_rows_impl(
 _dequant_rows = _mps_fused(_dequant_rows_impl, dynamic=False)
 
 
+# ---------------------------------------------------------------------------
+# Frozen-weight dequant cache (NPU)
+#
+# The training path multiplies the dequantized rotated weight on every forward.
+# Base weights are frozen during LoRA training, so that bf16 copy is identical
+# on every step (and on every gradient-checkpoint recompute). Cache it per
+# module when the device has headroom; the key tracks the int8 buffer identity
+# and version, so requantize_/merge invalidates it automatically.
+# ---------------------------------------------------------------------------
+
+_DEQUANT_CACHE_BYTES = 0
+_DEQUANT_CACHE_LIMIT = int(
+    float(os.environ.get("AITK_CONVROT_DEQUANT_CACHE_GB", "8")) * (1 << 30)
+)
+_DEQUANT_CACHE_ENABLED = (
+    os.environ.get("AITK_CONVROT_DEQUANT_CACHE", "1") != "0"
+    and _DEQUANT_CACHE_LIMIT > 0
+)
+_DEQUANT_CACHE_MIN_FREE = 6 << 30
+
+
+def _dequant_cache_key(module, dtype):
+    qdata = module.cr8_qdata
+    scales = module.cr8_scales
+    return (
+        qdata.data_ptr(),
+        qdata._version,
+        scales.data_ptr(),
+        scales._version,
+        dtype,
+        qdata.device.index,
+    )
+
+
+# Ascend int8 tensor-core path. npu_quant_matmul wants the weight as [K, N],
+# while ConvRot stores [N, K]; the transposed int8 copy is cached per module
+# (same bytes as the codes, so only the int8 copy is ever resident).
+_NPU_INT8_ENABLED = os.environ.get("AITK_CONVROT_NPU_INT8", "1") != "0"
+_NPU_INT8_OK = None
+_NPU_INT8_FAILED = set()
+_NPU_INT8T_BYTES = 0
+_NPU_INT8T_LIMIT = int(
+    float(os.environ.get("AITK_CONVROT_INT8_CACHE_GB", "6")) * (1 << 30)
+)
+
+
+def _npu_int8_supported(device) -> bool:
+    global _NPU_INT8_OK
+    if not _NPU_INT8_ENABLED or torch.device(device).type != "npu":
+        return False
+    if _NPU_INT8_OK is None:
+        try:
+            import torch_npu
+
+            x = torch.zeros(16, 128, dtype=torch.int8, device=device)
+            w = torch.zeros(128, 16, dtype=torch.int8, device=device)
+            s = torch.ones(16, dtype=torch.float32, device=device)
+            ps = torch.ones(16, dtype=torch.float32, device=device)
+            torch_npu.npu_quant_matmul(
+                x, w, s, pertoken_scale=ps, output_dtype=torch.bfloat16
+            )
+            _NPU_INT8_OK = True
+        except Exception:
+            _NPU_INT8_OK = False
+    return _NPU_INT8_OK
+
+
+def _transposed_qdata(module):
+    """Cached contiguous [K, N] int8 copy of the ConvRot codes, or None."""
+    global _NPU_INT8T_BYTES
+    qdata = module.cr8_qdata
+    key = (qdata.data_ptr(), qdata._version)
+    cached = getattr(module, "_cr8_qdata_t", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if cached is not None:
+        _NPU_INT8T_BYTES -= cached[1].numel() * cached[1].element_size()
+        module._cr8_qdata_t = None
+    nbytes = qdata.numel() * qdata.element_size()
+    if _NPU_INT8T_BYTES + nbytes > _NPU_INT8T_LIMIT:
+        return None
+    try:
+        free, _ = torch.npu.mem_get_info(qdata.device)
+    except Exception:
+        free = None
+    if free is not None and free < nbytes + (2 << 30):
+        return None
+    try:
+        qdata_t = qdata.t().contiguous()
+    except Exception:
+        return None
+    module._cr8_qdata_t = (key, qdata_t)
+    _NPU_INT8T_BYTES += nbytes
+    return qdata_t
+
+
+class _NpuInt8LinearSTE(torch.autograd.Function):
+    """W8A8 forward on Ascend, bf16 dgrad backward (base weights are frozen)."""
+
+    @staticmethod
+    def forward(ctx, x2d, qdata_t, scales, bias, out_dtype, w_bf16):
+        import torch_npu
+
+        aq, a_s = torch_npu.npu_dynamic_quant(x2d.detach(), dst_type=torch.int8)
+        out = torch_npu.npu_quant_matmul(
+            aq,
+            qdata_t,
+            scales,
+            pertoken_scale=a_s,
+            bias=bias,
+            output_dtype=out_dtype,
+        )
+        ctx.save_for_backward(w_bf16)
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (w_bf16,) = ctx.saved_tensors
+        grad_x = grad_out.matmul(w_bf16)
+        if ctx.bias_dtype is not None:
+            grad_bias = grad_out.sum(dim=0).to(ctx.bias_dtype)
+        else:
+            grad_bias = None
+        return grad_x, None, None, grad_bias, None, None
+
+
+def _try_cache_dequant(module, weight, key):
+    global _DEQUANT_CACHE_BYTES
+    if not _DEQUANT_CACHE_ENABLED or weight.device.type != "npu":
+        return
+    nbytes = weight.numel() * weight.element_size()
+    old = getattr(module, "_cr8_dequant_cache", None)
+    if old is not None:
+        _DEQUANT_CACHE_BYTES -= old[1].numel() * old[1].element_size()
+        module._cr8_dequant_cache = None
+    if _DEQUANT_CACHE_BYTES + nbytes > _DEQUANT_CACHE_LIMIT:
+        return
+    try:
+        free, _ = torch.npu.mem_get_info(weight.device)
+    except Exception:
+        free = None
+    if free is not None and free < nbytes + _DEQUANT_CACHE_MIN_FREE:
+        return
+    module._cr8_dequant_cache = (key, weight)
+    _DEQUANT_CACHE_BYTES += nbytes
+
+
 class ConvRotInt8Quantizer(OstrisQuantizer):
     """ConvRot W8A8 backend: shared regular-Hadamard rotation + per-token /
     per-output-channel symmetric int8 with torch._int_mm. One instance per qtype,
@@ -1407,10 +1562,18 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         s = self._scales(module).unsqueeze(1)
         return torch.round(w_rot.float() / s).clamp_(-127, 127) * s
 
-    def _dequantize_rotated(self, module, dtype: torch.dtype) -> torch.Tensor:
+    def _dequantize_rotated(self, module, dtype: torch.dtype, cache: bool = False) -> torch.Tensor:
         qdata, scales = self._qdata(module), self._scales(module)
         if qdata.device.type == "mps":
             return _dequant_rows(qdata, scales, dtype)
+        if cache and _DEQUANT_CACHE_ENABLED and qdata.device.type == "npu":
+            key = _dequant_cache_key(module, dtype)
+            cached = getattr(module, "_cr8_dequant_cache", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            w = (qdata.float() * scales.unsqueeze(1)).to(dtype)
+            _try_cache_dequant(module, w, key)
+            return w
         w = qdata.float() * scales.unsqueeze(1)
         return w.to(dtype)
 
@@ -1469,6 +1632,30 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                 return out.reshape(*x.shape[:-1], out_f)
             # no int8 hardware: straight-through fake-quant + bf16 matmul
             x2d = rotate(x, rot).reshape(-1, in_f)
+            npu_key = ("train", x.device.index, in_f, out_f)
+            if (
+                self.act_qmax == 127
+                and npu_key not in _NPU_INT8_FAILED
+                and _npu_int8_supported(x.device)
+            ):
+                qdata_t = _transposed_qdata(module)
+                if qdata_t is not None:
+                    try:
+                        # Ascend int8 tensor-core forward, bf16 dgrad backward.
+                        # The bf16 copy is only needed for backward, so do not
+                        # pin the 8 GiB dequant cache; recompute is cheap.
+                        w = self._dequantize_rotated(module, x.dtype)
+                        out = _NpuInt8LinearSTE.apply(
+                            x2d,
+                            qdata_t,
+                            self._scales(module),
+                            module.bias,
+                            x.dtype,
+                            w,
+                        )
+                        return out.reshape(*x.shape[:-1], out_f)
+                    except Exception:
+                        _NPU_INT8_FAILED.add(npu_key)
             with torch.no_grad():
                 if x.device.type == "mps":
                     # same arithmetic, as one fused Metal kernel instead of a
@@ -1477,7 +1664,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                 else:
                     aq, a_s = quantize_int8_rows(x2d.detach(), self.act_qmax)
                     x_dq = (aq.float() * a_s.unsqueeze(1)).to(x.dtype)
-                w = self._dequantize_rotated(module, x.dtype)
+                w = self._dequantize_rotated(module, x.dtype, cache=True)
             x_ste = x2d + (x_dq - x2d).detach()
             out = F.linear(x_ste, w, module.bias)
             return out.reshape(*x.shape[:-1], out_f)
@@ -1512,6 +1699,35 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                 i32[:m], a_s[:m], self._scales(module), module.bias, x.dtype
             )
             return out.reshape(*x.shape[:-1], out_f)
+
+        npu_key = ("infer", x.device.index, in_f, out_f)
+        if (
+            m >= 32
+            and self.act_qmax == 127
+            and npu_key not in _NPU_INT8_FAILED
+            and _npu_int8_supported(x.device)
+        ):
+            # Ascend int8 tensor cores for sampling/preview too; the transposed
+            # code buffer is the same one the training path uses.
+            qdata_t = _transposed_qdata(module)
+            if qdata_t is not None:
+                try:
+                    import torch_npu
+
+                    aq, a_s = torch_npu.npu_dynamic_quant(
+                        rotate(x, rot).reshape(-1, in_f), dst_type=torch.int8
+                    )
+                    out = torch_npu.npu_quant_matmul(
+                        aq,
+                        qdata_t,
+                        self._scales(module),
+                        pertoken_scale=a_s,
+                        bias=module.bias,
+                        output_dtype=x.dtype,
+                    )
+                    return out.reshape(*x.shape[:-1], out_f)
+                except Exception:
+                    _NPU_INT8_FAILED.add(npu_key)
 
         if _mps_int8pack_usable(x.device, in_f, out_f, x.dtype):
             # W8A16 on the int8 weight codes, no dequantized weight transient

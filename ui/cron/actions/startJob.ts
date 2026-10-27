@@ -230,6 +230,33 @@ const startAndWatchJob = (job: Job) => {
       // ASCEND_RT_VISIBLE_DEVICES renumbers the selected chips from local 0.
       jobConfig.config.process[0].device = 'npu:0';
     }
+
+    // MOSS-Image training repeatedly encodes the same dataset images and
+    // captions when caches are disabled. On NPU this work competes with the
+    // transformer stream and makes step time depend heavily on the sampled
+    // bucket. Enable the disk caches for WebUI-launched MOSS NPU jobs; set
+    // AITK_MOSS_NPU_CACHE=0 to keep the original behavior for an A/B run.
+    const processConfig = jobConfig.config.process[0];
+    const modelArch = processConfig.model?.arch;
+    if (
+      npuJob &&
+      job.job_type === 'train' &&
+      process.env.AITK_MOSS_NPU_CACHE !== '0' &&
+      typeof modelArch === 'string' &&
+      modelArch.startsWith('moss_image')
+    ) {
+      processConfig.train = {
+        ...(processConfig.train || {}),
+        cache_text_embeddings: true,
+      };
+      if (Array.isArray(processConfig.datasets)) {
+        processConfig.datasets = processConfig.datasets.map((dataset: any) => ({
+          ...dataset,
+          cache_latents_to_disk: true,
+          stable_bucket_order: process.env.AITK_MOSS_NPU_BUCKETS !== '0',
+        }));
+      }
+    }
     if (job.job_type === 'inference') {
       // the engine publishes engine.json (endpoint + token) and writes its
       // outputs under the job folder, which the UI proxy/file routes know
@@ -287,6 +314,39 @@ const startAndWatchJob = (job: Job) => {
 
     const args = [runFilePath, configPath];
 
+    // Tensor parallelism: one torchrun worker per selected NPU. The Python
+    // side reads AITK_TP/AITK_TP_SIZE, initializes HCCL and shards the MOSS
+    // transformer; rank 0 writes the job log, other ranks go to /tmp.
+    const tpSize = Number(processConfig.train?.tensor_parallel_size || 1);
+    if (tpSize > 1 && (isWindows || !npuJob)) {
+      throw new Error('Tensor parallel training requires multiple Ascend NPUs on Linux');
+    }
+    const tpEnabled = tpSize > 1;
+    if (tpEnabled) {
+      const selected = npuVisibleIds.split(',').map(id => id.trim()).filter(Boolean);
+      if (selected.length < tpSize) {
+        throw new Error(
+          `Tensor parallel needs ${tpSize} NPUs, but job.gpu_ids selected ${selected.length}`,
+        );
+      }
+      additionalEnv.ASCEND_RT_VISIBLE_DEVICES = selected.slice(0, tpSize).join(',');
+      additionalEnv.AITK_TP = '1';
+      additionalEnv.AITK_TP_SIZE = String(tpSize);
+      additionalEnv.SEED = additionalEnv.SEED || process.env.SEED || '42';
+    }
+    const torchrunPath = path.join(path.dirname(pythonPath), 'torchrun');
+    const useTorchrunBin = fs.existsSync(torchrunPath);
+    const launchCommand = tpEnabled && useTorchrunBin ? torchrunPath : pythonPath;
+    const launchArgs = tpEnabled
+      ? [
+          ...(useTorchrunBin ? [] : ['-m', 'torch.distributed.run']),
+          '--standalone',
+          '--nproc_per_node',
+          String(tpSize),
+          ...args,
+        ]
+      : args;
+
     // Where the Windows relay reports the job's real pid back to us.
     const relayPidPath = path.join(trainingFolder, '.job_pid');
 
@@ -319,7 +379,7 @@ const startAndWatchJob = (job: Job) => {
         });
       } else {
         // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
-        subprocess = spawn(pythonPath, args, {
+        subprocess = spawn(launchCommand, launchArgs, {
           detached: true,
           stdio: ['ignore', logFd, logFd], // don't tie stdio to parent; log fd passed as stdout and stderr
           env: {

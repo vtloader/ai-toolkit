@@ -2,6 +2,7 @@ import { SampleConfig } from "@/types";
 
 export const defaultSampleConfig: SampleConfig = {
   sampler: 'flowmatch',
+  scheduler: 'normal',
   sample_every: 250,
   sample_start_step: 0,
   width: 1024,
@@ -52,6 +53,7 @@ export const defaultSampleConfig: SampleConfig = {
 
 export const defaultAudioSampleConfig: SampleConfig = {
   sampler: 'flowmatch',
+  scheduler: 'normal',
   sample_every: 250,
   sample_start_step: 0,
   width: 1024,
@@ -407,6 +409,7 @@ It's Converging!
 
 export const defaultIdeogramSamplesConfig: SampleConfig = {
   sampler: 'flowmatch',
+  scheduler: 'normal',
   sample_every: 250,
   sample_start_step: 0,
   width: 1024,

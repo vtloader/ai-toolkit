@@ -1,5 +1,7 @@
 import os
 import sys
+import ctypes
+from pathlib import Path
 from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
@@ -31,6 +33,55 @@ suppress_child_consoles()
 # turn off diffusers telemetry until I can figure out how to make it opt-in
 os.environ['DISABLE_TELEMETRY'] = 'YES'
 
+# On Linux/aarch64, torch_npu loads libraries that consume most of the static
+# TLS slots before OpenCV and transformers import their native dependencies.
+# Loading libGLdispatch or scikit-learn's bundled libgomp afterwards can fail
+# with "cannot allocate memory in static TLS block".  Load both libraries first
+# so they can coexist in the job process.
+def _preload_native_runtime_libraries():
+    if not sys.platform.startswith('linux'):
+        return
+
+    for path in (
+        '/lib/aarch64-linux-gnu/libGLdispatch.so.0',
+        '/usr/lib/aarch64-linux-gnu/libGLdispatch.so.0',
+    ):
+        if not os.path.exists(path):
+            continue
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            continue
+        break
+
+    for path_entry in sys.path:
+        if not path_entry:
+            continue
+        candidates = sorted(Path(path_entry).glob('scikit_learn.libs/libgomp-*.so.*'))
+        if not candidates:
+            continue
+        try:
+            ctypes.CDLL(str(candidates[0]), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+        return
+
+
+_preload_native_runtime_libraries()
+
+# NPU throughput defaults: the Ascend task queue keeps kernel launches
+# asynchronous, and COMBINED_ENABLE fuses adjacent small ops. Both must be set
+# before torch_npu initializes. Opt out with AITK_NPU_PERF=0.
+if os.environ.get("AITK_NPU_PERF", "1") != "0":
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("torch_npu") is not None:
+            os.environ.setdefault("TASK_QUEUE_ENABLE", "1")
+            os.environ.setdefault("COMBINED_ENABLE", "1")
+    except Exception:
+        pass
+
 # set torch to trace mode
 import torch
     
@@ -41,6 +92,38 @@ if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
 # on unified memory devices (DGX Spark), offloading modules to cpu is useless and very slow
 from toolkit.util.unified_memory import apply_unified_memory_patches
 apply_unified_memory_patches()
+
+# Tensor parallel: torchrun launches one process per NPU and exposes RANK /
+# LOCAL_RANK / WORLD_SIZE. Bind this process to its chip and initialize HCCL
+# before any model or Accelerator is created.
+if os.environ.get("AITK_TP", "0") == "1":
+    import numpy as _np
+    import random as _random
+    import torch.distributed as _dist
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if hasattr(torch, "npu"):
+        torch.npu.set_device(local_rank)
+    if not _dist.is_initialized():
+        _dist.init_process_group(backend="hccl")
+    tp_world = _dist.get_world_size()
+    tp_rank = _dist.get_rank()
+    os.environ.setdefault("AITK_TP_SIZE", str(tp_world))
+    os.environ["AITK_TP_RANK"] = str(tp_rank)
+    # Every rank must see the same batch and noise for TP to be well defined.
+    tp_seed = int(os.environ.get("SEED", "42"))
+    os.environ.setdefault("SEED", str(tp_seed))
+    _random.seed(tp_seed)
+    _np.random.seed(tp_seed)
+    torch.manual_seed(tp_seed)
+    if hasattr(torch, "npu"):
+        torch.npu.manual_seed_all(tp_seed)
+    if tp_rank != 0:
+        _TP_LOG = open(f"/tmp/aitk_tp_rank{tp_rank}.log", "w", buffering=1)
+        sys.stdout = _TP_LOG
+        sys.stderr = _TP_LOG
+    else:
+        print(f"Tensor parallel: {tp_world} ranks, rank {tp_rank} on npu:{local_rank}")
 
 if seed is not None:
     import random
@@ -124,6 +207,7 @@ def main():
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:
+        job = None
         try:
             job = get_job(config_file, args.name)
             job.run()
@@ -132,18 +216,20 @@ def main():
         except Exception as e:
             print_acc(f"Error running job: {e}")
             jobs_failed += 1
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
+            if job is not None:
+                try:
+                    job.process[0].on_error(e)
+                except Exception as e2:
+                    print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e
         except KeyboardInterrupt as e:
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
+            if job is not None:
+                try:
+                    job.process[0].on_error(e)
+                except Exception as e2:
+                    print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_acc("")
                 print_acc("========================================")

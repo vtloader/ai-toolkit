@@ -406,6 +406,8 @@ class MossImageModel(BaseModel):
             uncond_skip_layers=self.uncond_skip_layers,
             ref_latents=ref_latents,
             isolate_refs=self.kv_cache,
+            sampler=getattr(gen_config, "sampler", None),
+            scheduler=getattr(gen_config, "scheduler", None),
         )
         return result[0]
 

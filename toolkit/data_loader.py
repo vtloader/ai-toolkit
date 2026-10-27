@@ -15,7 +15,7 @@ from toolkit.basic import is_npu_available
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 from tqdm import tqdm
 import albumentations as A
 
@@ -713,6 +713,45 @@ def dto_collation(batch: List['FileItemDTO']):
     )
 
 
+class StableBucketSampler(Sampler[int]):
+    """Group bucketed batches by latent area while shuffling each group.
+
+    MOSS-Image's transformer cost is dominated by image-token count. The
+    default DataLoader sampler interleaves all buckets randomly, which causes
+    frequent NPU shape changes and makes adjacent step times look erratic.
+    This sampler keeps the stochastic order inside each area group and only
+    changes the order in which groups are visited. The group order is shuffled
+    per epoch: visiting groups in ascending area would turn the naturally
+    area-proportional step cost into a monotonic ramp (and a sawtooth across
+    epoch boundaries), which makes ETAs and profiling look like a regression.
+    """
+
+    def __init__(self, dataset: ConcatDataset):
+        self.groups = {}
+        offset = 0
+        for child in dataset.datasets:
+            for local_index, batch in enumerate(getattr(child, 'batch_indices', ())):
+                if batch:
+                    item = child.file_list[batch[0]]
+                    area = int(getattr(item, 'crop_width', 0) * getattr(item, 'crop_height', 0))
+                else:
+                    area = 0
+                self.groups.setdefault(area, []).append(offset + local_index)
+            offset += len(child)
+        self._length = sum(len(indices) for indices in self.groups.values())
+
+    def __iter__(self):
+        areas = list(self.groups)
+        random.shuffle(areas)
+        for area in areas:
+            indices = list(self.groups[area])
+            random.shuffle(indices)
+            yield from indices
+
+    def __len__(self):
+        return self._length
+
+
 def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
@@ -808,11 +847,14 @@ def get_dataloader_from_datasets(
         for dataset in datasets:
             assert dataset.dataset_config.buckets, f"buckets not found on dataset {dataset.dataset_config.folder_path}, you either need all buckets or none"
 
+        stable_bucket_order = bool(dataset_config_list[0].stable_bucket_order)
+        bucket_sampler = StableBucketSampler(concatenated_dataset) if stable_bucket_order else None
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=None,  # we batch in the datasets for now
             drop_last=False,
-            shuffle=True,
+            shuffle=bucket_sampler is None,
+            sampler=bucket_sampler,
             collate_fn=dto_collation,  # Use the custom collate function
             **dataloader_kwargs
         )

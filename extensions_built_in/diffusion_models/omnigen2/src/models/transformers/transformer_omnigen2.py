@@ -23,7 +23,9 @@ from .block_lumina2 import LuminaLayerNormContinuous, LuminaRMSNormZero, LuminaF
 
 from ...utils.import_utils import is_triton_available, is_flash_attn_available
 
-if is_triton_available():
+# The fused implementation uses CUDA-only device queries during module import.
+# Keep that path for CUDA, while NPU and CPU use PyTorch's portable RMSNorm.
+if is_triton_available() and torch.cuda.is_available():
     from ...ops.triton.layer_norm import RMSNorm
 else:
     from torch.nn import RMSNorm

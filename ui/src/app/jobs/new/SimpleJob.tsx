@@ -65,6 +65,19 @@ export default function SimpleJob({
     return modelArchs.find(a => a.name === jobConfig.config.process[0].model.arch) as ModelArch;
   }, [modelArchs, jobConfig.config.process[0].model.arch]);
 
+  const samplerOptions = useMemo(
+    () =>
+      modelArch?.samplers ?? [
+        { value: 'flowmatch', label: 'FlowMatch' },
+        { value: 'ddpm', label: 'DDPM' },
+      ],
+    [modelArch],
+  );
+  const schedulerOptions = useMemo(
+    () => modelArch?.schedulers ?? [{ value: 'normal', label: 'Normal' }],
+    [modelArch],
+  );
+
   const jobType = useMemo(() => {
     return jobTypeOptions.find(j => j.value === jobConfig.config.process[0].type);
   }, [jobConfig.config.process[0].type]);
@@ -201,6 +214,14 @@ export default function SimpleJob({
   }, [modelArch]);
 
   const showGPUSelect = !isMac();
+  const tpSize = Number(
+    (jobConfig.config.process[0].train as any)?.tensor_parallel_size || 1,
+  );
+  const npuAccelerators = acceleratorList.filter(a => a.vendor === 'npu');
+  const canUseTP =
+    typeof jobConfig.config.process[0].model.arch === 'string' &&
+    jobConfig.config.process[0].model.arch.startsWith('moss_image') &&
+    npuAccelerators.length >= 2;
 
   const validationConfig = jobConfig.config.process[0].train.validation_config;
 
@@ -252,7 +273,7 @@ export default function SimpleJob({
               disabled={runId !== null}
               required
             />
-            {showGPUSelect && (
+            {showGPUSelect && tpSize <= 1 && (
               <SelectInput
                 label="Accelerator ID"
                 value={`${gpuIDs}`}
@@ -260,6 +281,36 @@ export default function SimpleJob({
                 onChange={value => setGpuIDs(value)}
                 options={acceleratorList.map(accel => ({ value: accel.id, label: accel.label }))}
               />
+            )}
+            {showGPUSelect && canUseTP && (
+              <SelectInput
+                label="Tensor Parallel (NPU)"
+                value={`${tpSize}`}
+                onChange={(value: string) => {
+                  const size = parseInt(value, 10) || 1;
+                  setJobConfig(size, 'config.process[0].train.tensor_parallel_size');
+                  if (size > 1) {
+                    setGpuIDs(npuAccelerators.slice(0, size).map(accel => accel.id).join(','));
+                  } else if (gpuIDs) {
+                    setGpuIDs(gpuIDs.split(',')[0]);
+                  }
+                }}
+                options={[
+                  { value: '1', label: 'Off (single NPU)' },
+                  {
+                    value: '2',
+                    label: `On (TP=2: ${npuAccelerators
+                      .slice(0, 2)
+                      .map(accel => accel.id)
+                      .join(' + ')})`,
+                  },
+                ]}
+              />
+            )}
+            {tpSize > 1 && (
+              <p className="text-sm text-gray-400">
+                Tensor parallel devices: {gpuIDs || npuAccelerators.slice(0, tpSize).map(a => a.id).join(',')}
+              </p>
             )}
             {disableSections.includes('trigger_word') ? null : (
               <TextInput
@@ -1516,12 +1567,25 @@ export default function SimpleJob({
                       label="Sampler"
                       className="pt-2"
                       value={jobConfig.config.process[0].sample.sampler}
-                      onChange={value => setJobConfig(value, 'config.process[0].sample.sampler')}
-                      options={[
-                        { value: 'flowmatch', label: 'FlowMatch' },
-                        { value: 'ddpm', label: 'DDPM' },
-                      ]}
+                      onChange={value => {
+                        setJobConfig(value, 'config.process[0].sample.sampler');
+                        if (value === 'dpmpp_2m' && !jobConfig.config.process[0].sample.scheduler) {
+                          setJobConfig('normal', 'config.process[0].sample.scheduler');
+                        }
+                      }}
+                      options={samplerOptions}
                     />
+                    {jobConfig.config.process[0].sample.sampler === 'dpmpp_2m' && (
+                      <SelectInput
+                        label="Scheduler"
+                        className="pt-2"
+                        value={jobConfig.config.process[0].sample.scheduler || 'normal'}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].sample.scheduler')
+                        }
+                        options={schedulerOptions}
+                      />
+                    )}
                     <NumberInput
                       label="Guidance Scale"
                       value={jobConfig.config.process[0].sample.guidance_scale}
