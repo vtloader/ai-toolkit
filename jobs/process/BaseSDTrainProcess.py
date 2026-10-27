@@ -549,6 +549,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def save(self, step=None):
         """Gather TP shards so rank 0 writes a normal full LoRA file."""
         tp = is_tp_enabled()
+        # EMA shadows follow the sharded training params. Apply them on every
+        # rank before gathering, otherwise rank 0 would copy a sharded EMA
+        # shadow into the full (unsharded) param and hit a shape mismatch.
+        tp_ema = tp and self.ema is not None
+        if tp_ema:
+            self.ema.eval()
         if tp:
             import torch.distributed as dist
 
@@ -558,17 +564,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
             tp_unshard_network(self.network)
         try:
-            self._save_impl(step)
+            self._save_impl(step, ema_applied=tp_ema)
         finally:
             if tp:
                 dist.barrier()
                 tp_reshard_network(self.network)
+                # restore the sharded pre-EMA params only after resharding:
+                # ema.train() copies shard-sized collected params back.
+                if tp_ema:
+                    self.ema.train()
 
-    def _save_impl(self, step=None):
+    def _save_impl(self, step=None, ema_applied=False):
         if not self.accelerator.is_main_process:
             return
         flush()
-        if self.ema is not None:
+        if self.ema is not None and not ema_applied:
             # always save params as ema
             self.ema.eval()
 
@@ -778,7 +788,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.clean_up_saves()
         self.post_save_hook(file_path)
 
-        if self.ema is not None:
+        if self.ema is not None and not ema_applied:
             self.ema.train()
         flush()
 
